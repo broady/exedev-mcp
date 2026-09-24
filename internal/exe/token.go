@@ -175,11 +175,24 @@ func agentSigner(ag agent.ExtendedAgent, key ssh.PublicKey) (ssh.Signer, error) 
 	return nil, fmt.Errorf("ssh agent: key %s not found", ssh.FingerprintSHA256(key))
 }
 
-// FindAgentKey picks the agent key to mint tokens with. If pin is set, the
-// key must match its SHA256 fingerprint or comment. Otherwise each key is
-// tried in agent order against the API (with a whoami-only token) and the
-// first that exe.dev accepts wins.
-func FindAgentKey(ctx context.Context, dial AgentDialer, endpoint, pin string) (ssh.PublicKey, error) {
+// KeyPrefs narrows which agent keys FindAgentKey considers, mirroring how
+// ssh picks identities.
+type KeyPrefs struct {
+	// Pin, if set, selects the key with this SHA256 fingerprint or comment,
+	// without probing.
+	Pin string
+	// Prefer lists keys to try first, in order (ssh's IdentityFile).
+	Prefer []ssh.PublicKey
+	// Only restricts probing to Prefer (ssh's IdentitiesOnly).
+	Only bool
+}
+
+// FindAgentKey picks the agent key to mint tokens with. Unless pinned, it
+// probes candidates against the API with a whoami-only token and the first
+// that exe.dev accepts wins. Probing signs with each candidate, which may
+// prompt (1Password, Secretive) and reveals the key to exe.dev, so preferred
+// keys go first.
+func FindAgentKey(ctx context.Context, dial AgentDialer, endpoint string, prefs KeyPrefs) (ssh.PublicKey, error) {
 	ag, closer, err := dial(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("ssh agent: %w", err)
@@ -189,19 +202,23 @@ func FindAgentKey(ctx context.Context, dial AgentDialer, endpoint, pin string) (
 	if err != nil {
 		return nil, fmt.Errorf("ssh agent: list keys: %w", err)
 	}
-	if pin != "" {
+	if prefs.Pin != "" {
 		for _, k := range keys {
-			if k.Comment == pin || ssh.FingerprintSHA256(k) == pin {
+			if k.Comment == prefs.Pin || ssh.FingerprintSHA256(k) == prefs.Pin {
 				return k, nil
 			}
 		}
-		return nil, fmt.Errorf("ssh agent: no key matches %q", pin)
+		return nil, fmt.Errorf("ssh agent: no key matches %q", prefs.Pin)
 	}
-	if len(keys) == 0 {
+	candidates := orderKeys(keys, prefs.Prefer, prefs.Only)
+	if len(candidates) == 0 {
+		if prefs.Only {
+			return nil, errors.New("ssh agent: none of the IdentityFile keys for exe.dev are in the agent (IdentitiesOnly is set)")
+		}
 		return nil, errors.New("ssh agent: no keys")
 	}
 	var errs []error
-	for _, k := range keys {
+	for _, k := range candidates {
 		signer, err := agentSigner(ag, k)
 		if err != nil {
 			return nil, err
@@ -225,4 +242,29 @@ func FindAgentKey(ctx context.Context, dial AgentDialer, endpoint, pin string) (
 		errs = append(errs, fmt.Errorf("%s (%s): not registered with exe.dev", ssh.FingerprintSHA256(k), k.Comment))
 	}
 	return nil, fmt.Errorf("no agent key is accepted by exe.dev: %w", errors.Join(errs...))
+}
+
+// orderKeys returns the agent keys in prefer order, followed (unless only)
+// by the remaining agent keys in agent order.
+func orderKeys(keys []*agent.Key, prefer []ssh.PublicKey, only bool) []*agent.Key {
+	out := make([]*agent.Key, 0, len(keys))
+	used := make(map[string]bool, len(keys))
+	for _, p := range prefer {
+		want := string(p.Marshal())
+		for _, k := range keys {
+			if !used[want] && string(k.Marshal()) == want {
+				used[want] = true
+				out = append(out, k)
+			}
+		}
+	}
+	if only {
+		return out
+	}
+	for _, k := range keys {
+		if !used[string(k.Marshal())] {
+			out = append(out, k)
+		}
+	}
+	return out
 }

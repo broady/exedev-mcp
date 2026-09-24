@@ -34,18 +34,38 @@ Claude Desktop (`claude_desktop_config.json`):
 }
 ```
 
-No token setup is needed. On each start, exe-mcp finds an agent key that
-exe.dev accepts and signs short-lived (1h) API tokens with it. The tokens are
-limited to VM management commands; billing and SSH key management are not
-allowed. GUI apps often start without `SSH_AUTH_SOCK`, so exe-mcp falls back
-to the `IdentityAgent` that `ssh -G exe.dev` reports. That covers agents such
-as 1Password and Secretive that are configured only in `~/.ssh/config`.
+No token setup is needed. exe-mcp signs short-lived (1h) API tokens with a key
+in your SSH agent. The tokens are limited to VM management commands; billing
+and SSH key management are not allowed.
+
+It picks the key the way `ssh exe.dev` does. It reads `ssh -G exe.dev` and
+tries the agent keys matching `IdentityFile` first, then the other agent keys
+unless `IdentitiesOnly yes` is set. It sends exe.dev a `whoami` token signed by
+each candidate until one is accepted. Every try is a signature, which may prompt
+(1Password, Secretive) and shows exe.dev that key, so pin the key to skip
+probing. The log prints the fingerprint it found:
+
+```
+claude mcp add exe -e EXE_SSH_KEY=SHA256:... -- exe-mcp stdio
+```
+
+```json
+"exe": {
+  "command": "/Users/you/go/bin/exe-mcp",
+  "args": ["stdio"],
+  "env": { "EXE_SSH_KEY": "SHA256:..." }
+}
+```
+
+GUI apps often start without `SSH_AUTH_SOCK`, so exe-mcp falls back to the
+`IdentityAgent` that `ssh -G exe.dev` reports. That covers agents such as
+1Password and Secretive that are configured only in `~/.ssh/config`.
 
 | Flag | Env | Default |
 |---|---|---|
 | `--token` | `EXE_TOKEN` | mint with the SSH agent |
 | `--ssh-agent` | `EXE_SSH_AUTH_SOCK` | `SSH_AUTH_SOCK`, then ssh's `IdentityAgent` |
-| `--key` | `EXE_SSH_KEY` | first agent key exe.dev accepts (match by `SHA256:` fingerprint or comment) |
+| `--key` | `EXE_SSH_KEY` | probe `IdentityFile` keys, then the rest (match by `SHA256:` fingerprint or comment) |
 | `--cmds` | `EXE_TOKEN_CMDS` | VM management commands |
 
 ## Hosted (remote connector)

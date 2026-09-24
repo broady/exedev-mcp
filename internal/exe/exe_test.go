@@ -178,8 +178,11 @@ func TestFindAgentKey(t *testing.T) {
 		keys = append(keys, pub)
 	}
 	registered := keys[1]
-	// Fake exe.dev that accepts only tokens signed by the registered key.
+	// Fake exe.dev that accepts only tokens signed by the registered key,
+	// recording how many keys were probed.
+	var probes int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		probes++
 		tok := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 		sig, _ := base64.RawURLEncoding.DecodeString(strings.Split(tok, ".")[2])
 		if !bytes.Contains(sig, registered.Marshal()) {
@@ -192,19 +195,44 @@ func TestFindAgentKey(t *testing.T) {
 	defer srv.Close()
 	dial := func(context.Context) (agent.ExtendedAgent, io.Closer, error) { return keyring, io.NopCloser(nil), nil }
 
-	got, err := FindAgentKey(t.Context(), dial, srv.URL, "")
+	got, err := FindAgentKey(t.Context(), dial, srv.URL, KeyPrefs{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(got.Marshal(), registered.Marshal()) {
 		t.Errorf("picked %s, want the registered key", ssh.FingerprintSHA256(got))
 	}
-	got, err = FindAgentKey(t.Context(), dial, srv.URL, "other")
+	if probes != 2 {
+		t.Errorf("agent order: %d probes, want 2", probes)
+	}
+
+	probes = 0
+	got, err = FindAgentKey(t.Context(), dial, srv.URL, KeyPrefs{Prefer: []ssh.PublicKey{registered}})
+	if err != nil || !bytes.Equal(got.Marshal(), registered.Marshal()) {
+		t.Errorf("prefer: got %v, %v", got, err)
+	}
+	if probes != 1 {
+		t.Errorf("prefer: %d probes, want 1 (preferred key first)", probes)
+	}
+
+	probes = 0
+	if _, err := FindAgentKey(t.Context(), dial, srv.URL, KeyPrefs{Prefer: keys[:1], Only: true}); err == nil {
+		t.Error("only an unregistered preferred key: want error")
+	}
+	if probes != 1 {
+		t.Errorf("only: %d probes, want 1 (other agent keys skipped)", probes)
+	}
+
+	probes = 0
+	got, err = FindAgentKey(t.Context(), dial, srv.URL, KeyPrefs{Pin: "other"})
 	if err != nil || !bytes.Equal(got.Marshal(), keys[0].Marshal()) {
 		t.Errorf("pin by comment: got %v, %v", got, err)
 	}
-	if _, err := FindAgentKey(t.Context(), dial, srv.URL, "nope"); err == nil {
+	if _, err := FindAgentKey(t.Context(), dial, srv.URL, KeyPrefs{Pin: "nope"}); err == nil {
 		t.Error("pin with no match: want error")
+	}
+	if probes != 0 {
+		t.Errorf("pin: %d probes, want 0", probes)
 	}
 }
 
