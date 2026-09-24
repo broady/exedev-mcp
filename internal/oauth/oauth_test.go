@@ -12,12 +12,16 @@ import (
 	"net/netip"
 	"net/url"
 	"path/filepath"
+	"reflect"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/auth"
+
+	"github.com/broady/exedev-mcp/internal/access"
 )
 
 const (
@@ -40,7 +44,15 @@ func newHarness(t *testing.T) *harness {
 
 func newHarnessAt(t *testing.T, statePath string) *harness {
 	t.Helper()
-	s, err := New(Config{Issuer: testIssuer, Owners: []string{"Owner@Example.com"}, StatePath: statePath})
+	return newHarnessCfg(t, Config{Issuer: testIssuer, Owners: []string{"Owner@Example.com"}, StatePath: statePath})
+}
+
+func newHarnessCfg(t *testing.T, cfg Config) *harness {
+	t.Helper()
+	if cfg.StatePath == "" {
+		cfg.StatePath = filepath.Join(t.TempDir(), "state.json")
+	}
+	s, err := New(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,7 +60,7 @@ func newHarnessAt(t *testing.T, statePath string) *harness {
 	s.Register(mux)
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
-	return &harness{t: t, s: s, srv: srv, statePath: statePath}
+	return &harness{t: t, s: s, srv: srv, statePath: cfg.StatePath}
 }
 
 // do sends a request as the exe.dev proxy would forward it: with the
@@ -117,8 +129,36 @@ func (h *harness) authorizeURL(p authzParams) string {
 
 var requestIDRE = regexp.MustCompile(`name="request_id" value="([^"]+)"`)
 
-// approve walks the consent page and returns the redirect location.
+// approve walks the consent page, choosing full access, and returns the
+// redirect location.
 func (h *harness) approve(p authzParams, action string) *url.URL {
+	h.t.Helper()
+	return h.approveWith(p, action, withOps(url.Values{"scope": {"all"}}, access.Ops()...))
+}
+
+// withOps adds op fields to a consent form.
+func withOps(form url.Values, ops ...access.Op) url.Values {
+	for _, op := range ops {
+		form.Add("op", string(op))
+	}
+	return form
+}
+
+func (h *harness) approveWith(p authzParams, action string, choice url.Values) *url.URL {
+	h.t.Helper()
+	resp := h.submitConsent(p, action, choice)
+	if resp.StatusCode != http.StatusFound {
+		h.t.Fatalf("consent: %d %s", resp.StatusCode, readAll(resp))
+	}
+	loc, err := url.Parse(resp.Header.Get("Location"))
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	return loc
+}
+
+// submitConsent loads the consent page and posts it with choice.
+func (h *harness) submitConsent(p authzParams, action string, choice url.Values) *http.Response {
 	h.t.Helper()
 	resp := h.do("GET", h.authorizeURL(p), owner, nil, nil)
 	page := readAll(resp)
@@ -130,18 +170,13 @@ func (h *harness) approve(p authzParams, action string) *url.URL {
 		h.t.Fatalf("no request_id in consent page:\n%s", page)
 	}
 	form := url.Values{"request_id": {m[1]}, "action": {action}}
-	resp = h.do("POST", "/oauth/authorize", owner, strings.NewReader(form.Encode()), http.Header{
+	for k, v := range choice {
+		form[k] = v
+	}
+	return h.do("POST", "/oauth/authorize", owner, strings.NewReader(form.Encode()), http.Header{
 		"Content-Type":   {"application/x-www-form-urlencoded"},
 		"Sec-Fetch-Site": {"same-origin"},
 	})
-	if resp.StatusCode != http.StatusFound {
-		h.t.Fatalf("consent: %d %s", resp.StatusCode, readAll(resp))
-	}
-	loc, err := url.Parse(resp.Header.Get("Location"))
-	if err != nil {
-		h.t.Fatal(err)
-	}
-	return loc
 }
 
 // fullFlow registers a client, approves it, exchanges the code, and
@@ -450,7 +485,7 @@ func TestClientIDMetadataDocument(t *testing.T) {
 	redirect := "http://localhost:53712/callback"
 	resp := h.do("GET", h.authorizeURL(authzParams{clientID: clientID, redirect: redirect, challenge: challenge}), owner, nil, nil)
 	page := readAll(resp)
-	if resp.StatusCode != 200 || !strings.Contains(page, "verified") || !strings.Contains(page, "application on this computer") {
+	if resp.StatusCode != 200 || !strings.Contains(page, "verified") || !strings.Contains(page, "app on this computer") {
 		t.Fatalf("consent: %d\n%s", resp.StatusCode, page)
 	}
 	code := h.approve(authzParams{clientID: clientID, redirect: redirect, challenge: challenge}, "approve").Query().Get("code")
@@ -572,9 +607,6 @@ func TestGrantsPageRevoke(t *testing.T) {
 		"client_id": {string(id)}, "code_verifier": {verifier},
 	})
 
-	if loc := h.do("GET", "/oauth/grants", owner, nil, nil).Header.Get("Location"); loc != "/" {
-		t.Errorf("old grants URL redirects to %q, want /", loc)
-	}
 	page := readAll(h.do("GET", "/", owner, nil, nil))
 	m := regexp.MustCompile(`name="grant_id" value="([^"]+)"`).FindStringSubmatch(page)
 	if m == nil || !strings.Contains(page, "Claude") {
@@ -709,18 +741,10 @@ func TestNewValidatesConfig(t *testing.T) {
 func TestDashboard(t *testing.T) {
 	var acct string
 	var acctErr error
-	s, err := New(Config{
-		Issuer: testIssuer, Owners: []string{owner}, StatePath: filepath.Join(t.TempDir(), "state.json"),
+	h := newHarnessCfg(t, Config{
+		Issuer: testIssuer, Owners: []string{owner},
 		Account: func(context.Context) (string, error) { return acct, acctErr },
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	mux := http.NewServeMux()
-	s.Register(mux)
-	srv := httptest.NewServer(mux)
-	t.Cleanup(srv.Close)
-	h := &harness{t: t, s: s, srv: srv}
 
 	if resp := h.do("GET", "/", "", nil, nil); resp.StatusCode != http.StatusFound || !strings.Contains(resp.Header.Get("Location"), "/__exe.dev/login") {
 		t.Errorf("signed out: %d %s", resp.StatusCode, resp.Header.Get("Location"))
@@ -742,6 +766,218 @@ func TestDashboard(t *testing.T) {
 		page := readAll(h.do("GET", "/", owner, nil, nil))
 		if !strings.Contains(page, tc.want) || !strings.Contains(page, testIssuer+"/mcp") {
 			t.Errorf("%s: page missing %q or connector URL:\n%s", tc.name, tc.want, page)
+		}
+	}
+}
+
+func newVMHarness(t *testing.T, listErr error) *harness {
+	t.Helper()
+	return newHarnessCfg(t, Config{
+		Issuer: testIssuer, Owners: []string{owner}, HostVM: "mcp-host",
+		VMs: func(context.Context) ([]access.VM, error) {
+			return []access.VM{{Name: "web", Tags: []string{"prod"}}, {Name: "dev"}, {Name: "mcp-host", Tags: []string{"prod"}}}, listErr
+		},
+	})
+}
+
+// grantFor completes a flow with the given consent choice and returns the
+// access token.
+func (h *harness) grantFor(choice url.Values) string {
+	h.t.Helper()
+	id := h.register(claudeCB)
+	verifier, challenge := pkce()
+	code := h.approveWith(authzParams{clientID: id, redirect: claudeCB, challenge: challenge}, "approve", choice).Query().Get("code")
+	status, tok := h.tokenReq(url.Values{
+		"grant_type": {"authorization_code"}, "code": {code}, "redirect_uri": {claudeCB},
+		"client_id": {string(id)}, "code_verifier": {verifier},
+	})
+	if status != 200 {
+		h.t.Fatalf("token: %d %v", status, tok)
+	}
+	return str(tok, "access_token")
+}
+
+func (h *harness) policyOf(at string) access.Policy {
+	h.t.Helper()
+	info, err := h.s.Verify(h.t.Context(), at, nil)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	p, err := PolicyOf(info)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	return p
+}
+
+func TestConsentOffersVMsAndTags(t *testing.T) {
+	h := newVMHarness(t, nil)
+	id := h.register(claudeCB)
+	_, challenge := pkce()
+	page := readAll(h.do("GET", h.authorizeURL(authzParams{clientID: id, redirect: claudeCB, challenge: challenge}), owner, nil, nil))
+	for _, want := range []string{`name="vm" value="web"`, `name="vm" value="dev"`, `name="tag" value="prod"`, `id="scope-all" checked`, `id="scope-tags"`, `name="op" value="read" checked`, `name="op" value="manage" checked`} {
+		if !strings.Contains(page, want) {
+			t.Errorf("consent page missing %s", want)
+		}
+	}
+	if strings.Contains(page, `name="vm" value="mcp-host"`) || !strings.Contains(page, `disabled><span class="n">mcp-host`) {
+		t.Error("host VM offered to limited connections")
+	}
+}
+
+func TestLimitedGrant(t *testing.T) {
+	h := newVMHarness(t, nil)
+	// Lists for scopes other than the chosen one are ignored.
+	at := h.grantFor(withOps(url.Values{"scope": {"vms"}, "vm": {"dev"}, "tag": {"prod"}}, access.OpRead))
+	want := access.Policy{VMs: []string{"dev"}, Ops: []access.Op{access.OpRead}}
+	if got := h.policyOf(at); !reflect.DeepEqual(got, want) {
+		t.Errorf("policy = %+v, want %+v", got, want)
+	}
+	if page := readAll(h.do("GET", "/", owner, nil, nil)); !strings.Contains(page, "dev: read") {
+		t.Error("dashboard does not show the grant's access")
+	}
+	// The policy is persisted with the grant.
+	h2 := newHarnessCfg(t, Config{Issuer: testIssuer, Owners: []string{owner}, StatePath: h.statePath})
+	if got := h2.policyOf(at); !reflect.DeepEqual(got, want) {
+		t.Errorf("policy after restart = %+v", got)
+	}
+
+	for name, tc := range map[string]struct {
+		form url.Values
+		want access.Policy
+	}{
+		"all": {withOps(url.Values{"scope": {"all"}}, access.Ops()...), access.Full()},
+		// manage is hidden outside the all scope, so it is dropped.
+		"by tag": {
+			withOps(url.Values{"scope": {"tags"}, "tag": {"prod"}, "vm": {"dev"}}, access.OpRun, access.OpManage),
+			access.Policy{Tags: []string{"prod"}, Ops: []access.Op{access.OpRun}},
+		},
+		"list only": {url.Values{"scope": {"all"}}, access.Policy{AllVMs: true, Ops: []access.Op{}}},
+		"no scope":  {withOps(url.Values{}, access.OpRead), access.Policy{AllVMs: true, Ops: []access.Op{access.OpRead}}},
+	} {
+		got := h.policyOf(h.grantFor(tc.form))
+		if got.AllVMs != tc.want.AllVMs || !slices.Equal(got.VMs, tc.want.VMs) || !slices.Equal(got.Tags, tc.want.Tags) || !slices.Equal(got.Ops, tc.want.Ops) {
+			t.Errorf("%s: policy = %+v, want %+v", name, got, tc.want)
+		}
+	}
+}
+
+func TestConsentRejectsBadChoiceAndKeepsRequest(t *testing.T) {
+	h := newVMHarness(t, nil)
+	id := h.register(claudeCB)
+	_, challenge := pkce()
+	p := authzParams{clientID: id, redirect: claudeCB, challenge: challenge}
+	for name, tc := range map[string]struct {
+		choice url.Values
+		want   string
+	}{
+		"nothing chosen": {url.Values{"scope": {"vms"}}, "pick at least one VM or tag"},
+		"host VM":        {url.Values{"scope": {"vms"}, "vm": {"mcp-host"}}, "only available with all VMs"},
+		"bad name":       {url.Values{"scope": {"vms"}, "vm": {"Nope!"}}, "invalid VM name"},
+	} {
+		resp := h.submitConsent(p, "approve", tc.choice)
+		page := readAll(resp)
+		if resp.StatusCode != http.StatusBadRequest || !strings.Contains(page, tc.want) {
+			t.Errorf("%s: %d, page missing %q", name, resp.StatusCode, tc.want)
+			continue
+		}
+		// The re-rendered page carries the same request: fixing the
+		// choice completes it.
+		rid := requestIDRE.FindStringSubmatch(page)
+		if rid == nil {
+			t.Fatalf("%s: no request_id on re-rendered page", name)
+		}
+		form := url.Values{"request_id": {rid[1]}, "action": {"approve"}, "scope": {"vms"}, "vm": {"dev"}}
+		resp = h.do("POST", "/oauth/authorize", owner, strings.NewReader(form.Encode()), http.Header{
+			"Content-Type": {"application/x-www-form-urlencoded"}, "Sec-Fetch-Site": {"same-origin"},
+		})
+		if resp.StatusCode != http.StatusFound || !strings.Contains(resp.Header.Get("Location"), "code=") {
+			t.Errorf("%s: retry: %d %s", name, resp.StatusCode, resp.Header.Get("Location"))
+		}
+	}
+}
+
+func TestConsentFullOnlyWhenVMsUnavailable(t *testing.T) {
+	h := newVMHarness(t, errors.New("API down"))
+	id := h.register(claudeCB)
+	_, challenge := pkce()
+	p := authzParams{clientID: id, redirect: claudeCB, challenge: challenge}
+	page := readAll(h.do("GET", h.authorizeURL(p), owner, nil, nil))
+	if strings.Contains(page, `name="vm"`) || strings.Contains(page, `id="scope-vms"`) {
+		t.Errorf("consent page when VMs are unavailable:\n%s", page)
+	}
+	// A crafted limited choice is refused rather than granted unchecked.
+	if resp := h.submitConsent(p, "approve", url.Values{"scope": {"vms"}, "vm": {"dev"}}); resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("limited choice without a VM list: %d", resp.StatusCode)
+	}
+}
+
+func TestPolicyOfFailsClosed(t *testing.T) {
+	for _, info := range []*auth.TokenInfo{nil, {}, {Extra: map[string]any{accessKey: "all"}}} {
+		if p, err := PolicyOf(info); err == nil || p.AllVMs || len(p.Ops) > 0 {
+			t.Errorf("PolicyOf(%+v) = %+v, %v", info, p, err)
+		}
+	}
+}
+
+func TestLastUsed(t *testing.T) {
+	h := newHarness(t)
+	now := time.Now()
+	h.s.now = func() time.Time { return now }
+	at, _ := h.fullFlow()
+	if page := readAll(h.do("GET", "/", owner, nil, nil)); !strings.Contains(page, "never used") {
+		t.Error("new grant not shown as never used")
+	}
+	grant := func() *grant {
+		for _, g := range h.s.st.Grants {
+			return g
+		}
+		t.Fatal("no grant")
+		return nil
+	}
+
+	if _, err := h.s.Verify(t.Context(), at, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := grant().UsedAt; !got.Equal(now) {
+		t.Errorf("UsedAt = %v, want %v", got, now)
+	}
+	// Use within the resolution is not recorded, sparing a disk write.
+	first := now
+	now = now.Add(usedResolution / 2)
+	h.s.Verify(t.Context(), at, nil)
+	if got := grant().UsedAt; !got.Equal(first) {
+		t.Errorf("UsedAt moved within resolution: %v", got)
+	}
+	now = first.Add(5 * time.Minute)
+	h.s.Verify(t.Context(), at, nil)
+	if page := readAll(h.do("GET", "/", owner, nil, nil)); !strings.Contains(page, "used just now") {
+		t.Error("dashboard does not show recent use")
+	}
+	// The last use is persisted.
+	h2 := newHarnessCfg(t, Config{Issuer: testIssuer, Owners: []string{owner}, StatePath: h.statePath})
+	for _, g := range h2.s.st.Grants {
+		if !g.UsedAt.Equal(now) {
+			t.Errorf("persisted UsedAt = %v, want %v", g.UsedAt, now)
+		}
+	}
+}
+
+func TestAgo(t *testing.T) {
+	now := time.Date(2026, 9, 24, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		t    time.Time
+		want string
+	}{
+		{time.Time{}, "never used"},
+		{now.Add(-30 * time.Second), "used just now"},
+		{now.Add(-5 * time.Minute), "used 5m ago"},
+		{now.Add(-3 * time.Hour), "used 3h ago"},
+		{now.Add(-50 * time.Hour), "used 2d ago"},
+		{time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC), "used Jan 2, 2026"},
+	} {
+		if got := ago(now, tc.t); got != tc.want {
+			t.Errorf("ago(%v) = %q, want %q", tc.t, got, tc.want)
 		}
 	}
 }

@@ -42,7 +42,7 @@ func (c *stdioCmd) Run(a *app) error {
 		return err
 	}
 	a.log.Info("serving MCP on stdio")
-	if err := tools.NewServer(client, version()).Run(a.ctx, &mcp.StdioTransport{}); err != nil && !errors.Is(err, context.Canceled) {
+	if err := tools.NewServer(client, version(), tools.Options{}).Run(a.ctx, &mcp.StdioTransport{}); err != nil && !errors.Is(err, context.Canceled) {
 		return fmt.Errorf("stdio server: %w", err)
 	}
 	return nil

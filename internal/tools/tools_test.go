@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -10,12 +11,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/broady/exedev-mcp/internal/access"
 	"github.com/broady/exedev-mcp/internal/exe"
 )
 
@@ -33,6 +36,11 @@ type fakeExe struct {
 
 func newFakeExe(t *testing.T) (*fakeExe, *mcp.ClientSession) {
 	t.Helper()
+	return newFakeExeWith(t, Options{})
+}
+
+func newFakeExeWith(t *testing.T, opts Options) (*fakeExe, *mcp.ClientSession) {
+	t.Helper()
 	if _, err := exec.LookPath("bash"); err != nil {
 		t.Skip("bash not installed")
 	}
@@ -43,7 +51,7 @@ func newFakeExe(t *testing.T) (*fakeExe, *mcp.ClientSession) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := NewServer(c, "test")
+	server := NewServer(c, "test", opts)
 	client := mcp.NewClient(&mcp.Implementation{Name: "test"}, nil)
 	st, ct := mcp.NewInMemoryTransports()
 	ss, err := server.Connect(t.Context(), st, nil)
@@ -94,7 +102,7 @@ func (f *fakeExe) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	f.mu.Unlock()
 	switch {
 	case body == "ls":
-		io.WriteString(w, `{"vms":[{"vm_name":"testvm","status":"running","https_url":"https://testvm.exe.xyz","ssh_dest":"testvm.exe.xyz","tags":["a"],"allocated_cpus":2}],"shared_vms":[{"vm_name":"theirs","status":"running","owner_email":"x@y.z"}]}`)
+		io.WriteString(w, `{"vms":[{"vm_name":"testvm","status":"running","https_url":"https://testvm.exe.xyz","ssh_dest":"testvm.exe.xyz","tags":["a"],"allocated_cpus":2},{"vm_name":"other","tags":["b"]},{"vm_name":"host","tags":["a"]}],"shared_vms":[{"vm_name":"theirs","status":"running","owner_email":"x@y.z"}]}`)
 	case strings.HasPrefix(body, "new"), strings.HasPrefix(body, "rm "), strings.HasPrefix(body, "share show"):
 		io.WriteString(w, `{"ok":true}`)
 	default:
@@ -138,7 +146,7 @@ func TestListVMs(t *testing.T) {
 	if err := json.Unmarshal(b, &out); err != nil {
 		t.Fatal(err)
 	}
-	if len(out.VMs) != 1 || out.VMs[0].Name != "testvm" || out.VMs[0].CPUs != 2 || out.VMs[0].URL != "https://testvm.exe.xyz" {
+	if len(out.VMs) != 3 || out.VMs[0].Name != "testvm" || out.VMs[0].CPUs != 2 || out.VMs[0].URL != "https://testvm.exe.xyz" {
 		t.Errorf("vms = %+v", out.VMs)
 	}
 	if len(out.Shared) != 1 || out.Shared[0].Owner != "x@y.z" {
@@ -279,5 +287,142 @@ func TestWriteFileLargeIsChunked(t *testing.T) {
 	}
 	if fi, err := os.Stat(filepath.Join(f.home, "empty")); err != nil || fi.Size() != 0 {
 		t.Errorf("empty file: %v %v", fi, err)
+	}
+}
+
+func fixedPolicy(p access.Policy) func(*mcp.CallToolRequest) (access.Policy, error) {
+	return func(*mcp.CallToolRequest) (access.Policy, error) { return p, nil }
+}
+
+func listedVMs(t *testing.T, cs *mcp.ClientSession) []string {
+	t.Helper()
+	res, err := cs.CallTool(t.Context(), &mcp.CallToolParams{Name: "list_vms"})
+	if err != nil || res.IsError {
+		t.Fatalf("list_vms: %v %v", err, res)
+	}
+	var out listVMsOutput
+	b, _ := json.Marshal(res.StructuredContent)
+	if err := json.Unmarshal(b, &out); err != nil {
+		t.Fatal(err)
+	}
+	names := make([]string, 0, len(out.VMs)+len(out.Shared))
+	for _, v := range append(out.VMs, out.Shared...) {
+		names = append(names, v.Name)
+	}
+	return names
+}
+
+func TestPolicyByName(t *testing.T) {
+	_, cs := newFakeExeWith(t, Options{Policy: fixedPolicy(access.Policy{VMs: []string{"testvm"}, Ops: []access.Op{access.OpRead, access.OpRun, access.OpRestart}}), HostVM: "host"})
+	if out, isErr := call(t, cs, "run_command", map[string]any{"vm": "testvm", "command": "echo hi"}); isErr || !strings.Contains(out, "hi") {
+		t.Errorf("allowed VM: %q", out)
+	}
+	for tool, args := range map[string]map[string]any{
+		"run_command": {"vm": "other", "command": "true"},
+		"read_file":   {"vm": "other", "path": "x"},
+		"restart_vm":  {"vm": "other"},
+	} {
+		out, isErr := call(t, cs, tool, args)
+		if !isErr || !strings.Contains(out, "not allowed to use VM other") {
+			t.Errorf("%s on other VM: %v %q", tool, isErr, out)
+		}
+	}
+	if got := strings.Join(listedVMs(t, cs), ","); got != "testvm" {
+		t.Errorf("list_vms = %s", got)
+	}
+	// Account-level tools are offered (Options.Ops is nil) but refuse.
+	for tool, args := range map[string]map[string]any{
+		"create_vm":   {},
+		"delete_vm":   {"vm": "testvm"},
+		"exe_command": {"command": "ls"},
+	} {
+		out, isErr := call(t, cs, tool, args)
+		if !isErr || !strings.Contains(out, "not allowed to manage") {
+			t.Errorf("%s: %v %q", tool, isErr, out)
+		}
+	}
+}
+
+func TestPolicyByTagExcludesHost(t *testing.T) {
+	_, cs := newFakeExeWith(t, Options{Policy: fixedPolicy(access.Policy{Tags: []string{"a"}, Ops: []access.Op{access.OpRun}}), HostVM: "host"})
+	if _, isErr := call(t, cs, "run_command", map[string]any{"vm": "testvm", "command": "true"}); isErr {
+		t.Error("tagged VM refused")
+	}
+	// host carries tag a, but running commands there reaches the API
+	// integration: only full access may.
+	if out, isErr := call(t, cs, "run_command", map[string]any{"vm": "host", "command": "true"}); !isErr || !strings.Contains(out, "not allowed") {
+		t.Errorf("host VM: %v %q", isErr, out)
+	}
+	if got := strings.Join(listedVMs(t, cs), ","); got != "testvm" {
+		t.Errorf("list_vms = %s", got)
+	}
+}
+
+func TestPolicyFailsClosed(t *testing.T) {
+	_, cs := newFakeExeWith(t, Options{Policy: func(*mcp.CallToolRequest) (access.Policy, error) {
+		return access.Policy{}, errors.New("no policy")
+	}})
+	if out, isErr := call(t, cs, "run_command", map[string]any{"vm": "testvm", "command": "true"}); !isErr || !strings.Contains(out, "no policy") {
+		t.Errorf("run_command: %v %q", isErr, out)
+	}
+}
+
+func TestReadOnly(t *testing.T) {
+	f, cs := newFakeExeWith(t, Options{Policy: fixedPolicy(access.Policy{AllVMs: true, Ops: []access.Op{access.OpRead}})})
+	if err := os.WriteFile(filepath.Join(f.home, "x"), []byte("hello\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if out, isErr := call(t, cs, "read_file", map[string]any{"vm": "testvm", "path": "x"}); isErr || !strings.Contains(out, "hello") {
+		t.Errorf("read_file: %q", out)
+	}
+	for tool, args := range map[string]map[string]any{
+		"run_command": {"vm": "testvm", "command": "touch y"},
+		"write_file":  {"vm": "testvm", "path": "y", "content": "z"},
+		"edit_file":   {"vm": "testvm", "path": "x", "old_string": "hello", "new_string": "bye"},
+		"restart_vm":  {"vm": "testvm"},
+		"delete_vm":   {"vm": "testvm"},
+	} {
+		if out, isErr := call(t, cs, tool, args); !isErr || !strings.Contains(out, "not allowed to") {
+			t.Errorf("%s: %v %q", tool, isErr, out)
+		}
+	}
+	if b, _ := os.ReadFile(filepath.Join(f.home, "x")); string(b) != "hello\n" {
+		t.Errorf("file changed: %q", b)
+	}
+	if _, err := os.Stat(filepath.Join(f.home, "y")); err == nil {
+		t.Error("read-only connection created a file")
+	}
+}
+
+func TestOpsSelectTools(t *testing.T) {
+	for _, tc := range []struct {
+		ops  []access.Op
+		want string
+	}{
+		{nil, "create_vm,delete_vm,edit_file,exe_command,list_vms,read_file,restart_vm,run_command,write_file"},
+		{[]access.Op{}, "list_vms"},
+		{[]access.Op{access.OpRead}, "list_vms,read_file"},
+		{[]access.Op{access.OpWrite, access.OpRun}, "edit_file,list_vms,run_command,write_file"},
+	} {
+		_, cs := newFakeExeWith(t, Options{Ops: tc.ops})
+		res, err := cs.ListTools(t.Context(), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		names := make([]string, 0, len(res.Tools))
+		for _, tool := range res.Tools {
+			names = append(names, tool.Name)
+		}
+		slices.Sort(names)
+		if got := strings.Join(names, ","); got != tc.want {
+			t.Errorf("ops %v: tools = %s, want %s", tc.ops, got, tc.want)
+		}
+	}
+}
+
+func TestFullAccessSeesHost(t *testing.T) {
+	_, cs := newFakeExeWith(t, Options{Policy: fixedPolicy(access.Full()), HostVM: "host"})
+	if got := strings.Join(listedVMs(t, cs), ","); got != "testvm,other,host,theirs" {
+		t.Errorf("list_vms = %s", got)
 	}
 }

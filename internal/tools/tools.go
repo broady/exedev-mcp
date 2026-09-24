@@ -6,11 +6,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/broady/exedev-mcp/internal/access"
 	"github.com/broady/exedev-mcp/internal/exe"
 )
 
@@ -35,65 +37,143 @@ const (
 	execTimeoutMargin = 30 * time.Second
 )
 
+// Options configure access control. The zero value gives every call full
+// access, as in stdio mode where the user runs the server as themselves.
+type Options struct {
+	// Policy returns the access policy of the connection making a call,
+	// checked on every call. Nil means full access.
+	Policy func(*mcp.CallToolRequest) (access.Policy, error)
+	// Ops selects which tools the server offers; nil offers all. Set it to
+	// the connection's allowed operations so clients don't offer tools that
+	// would always fail.
+	Ops []access.Op
+	// HostVM is the VM this server runs on. It holds the API integration,
+	// so running commands there is equivalent to full access: policies
+	// without AllVMs never allow it.
+	HostVM string
+}
+
 // NewServer returns an MCP server exposing exe.dev through c.
-func NewServer(c *exe.Client, version string) *mcp.Server {
+func NewServer(c *exe.Client, version string, opts Options) *mcp.Server {
 	s := mcp.NewServer(&mcp.Implementation{Name: "exe.dev", Title: "exe.dev", Version: version}, &mcp.ServerOptions{
 		Instructions: instructions,
 	})
-	t := &toolset{c: c}
+	t := &toolset{c: c, policy: opts.Policy, hostVM: opts.HostVM}
+	offer := func(op access.Op) bool { return opts.Ops == nil || slices.Contains(opts.Ops, op) }
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "list_vms",
 		Description: "List your exe.dev VMs and VMs shared with you.",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true, OpenWorldHint: new(false)},
 	}, t.listVMs)
-	mcp.AddTool(s, &mcp.Tool{
-		Name:        "create_vm",
-		Description: "Create a new exe.dev VM. It is ready in seconds. Optionally give an initial task to the Shelley coding agent on the new VM.",
-		Annotations: &mcp.ToolAnnotations{DestructiveHint: new(false), OpenWorldHint: new(false)},
-	}, t.createVM)
-	mcp.AddTool(s, &mcp.Tool{
-		Name:        "delete_vm",
-		Description: "Permanently delete an exe.dev VM and its disk. This cannot be undone.",
-		Annotations: &mcp.ToolAnnotations{DestructiveHint: new(true), IdempotentHint: true, OpenWorldHint: new(false)},
-	}, t.deleteVM)
-	mcp.AddTool(s, &mcp.Tool{
-		Name:        "restart_vm",
-		Description: "Restart an exe.dev VM. Running processes are killed; the disk is kept.",
-		Annotations: &mcp.ToolAnnotations{DestructiveHint: new(true), IdempotentHint: true, OpenWorldHint: new(false)},
-	}, t.restartVM)
-	mcp.AddTool(s, &mcp.Tool{
-		Name: "exe_command",
-		Description: "Run any exe.dev lobby command and return its JSON output, e.g. `share show myvm`, `share set-public myvm`, `tag myvm prod`, `resize myvm --disk=50GB`, `help new`. " +
-			"Run `help` to list commands. Which commands are allowed depends on the API token.",
-		Annotations: &mcp.ToolAnnotations{DestructiveHint: new(true), OpenWorldHint: new(false)},
-	}, t.exeCommand)
-	mcp.AddTool(s, &mcp.Tool{
-		Name: "run_command",
-		Description: "Run a bash command or script on a VM and return its combined stdout/stderr and exit status. " +
-			"Runs as the VM's default user in a login shell with no stdin. Output over 64KiB keeps the head and tail.",
-		Annotations: &mcp.ToolAnnotations{DestructiveHint: new(true), OpenWorldHint: new(true)},
-	}, t.runCommand)
-	mcp.AddTool(s, &mcp.Tool{
-		Name:        "read_file",
-		Description: "Read a text file on a VM, with line numbers. Relative paths are relative to the home directory.",
-		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true, OpenWorldHint: new(false)},
-	}, t.readFile)
-	mcp.AddTool(s, &mcp.Tool{
-		Name:        "write_file",
-		Description: "Create or overwrite a file on a VM atomically, creating parent directories. Keeps the mode of an existing file.",
-		Annotations: &mcp.ToolAnnotations{DestructiveHint: new(true), IdempotentHint: true, OpenWorldHint: new(false)},
-	}, t.writeFile)
-	mcp.AddTool(s, &mcp.Tool{
-		Name:        "edit_file",
-		Description: "Replace exact text in a file on a VM. old_string must match exactly once unless replace_all is set.",
-		Annotations: &mcp.ToolAnnotations{DestructiveHint: new(true), OpenWorldHint: new(false)},
-	}, t.editFile)
+	if offer(access.OpRead) {
+		mcp.AddTool(s, &mcp.Tool{
+			Name:        "read_file",
+			Description: "Read a text file on a VM, with line numbers. Relative paths are relative to the home directory.",
+			Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true, OpenWorldHint: new(false)},
+		}, t.readFile)
+	}
+	if offer(access.OpWrite) {
+		mcp.AddTool(s, &mcp.Tool{
+			Name:        "write_file",
+			Description: "Create or overwrite a file on a VM atomically, creating parent directories. Keeps the mode of an existing file.",
+			Annotations: &mcp.ToolAnnotations{DestructiveHint: new(true), IdempotentHint: true, OpenWorldHint: new(false)},
+		}, t.writeFile)
+		mcp.AddTool(s, &mcp.Tool{
+			Name:        "edit_file",
+			Description: "Replace exact text in a file on a VM. old_string must match exactly once unless replace_all is set.",
+			Annotations: &mcp.ToolAnnotations{DestructiveHint: new(true), OpenWorldHint: new(false)},
+		}, t.editFile)
+	}
+	if offer(access.OpRun) {
+		mcp.AddTool(s, &mcp.Tool{
+			Name: "run_command",
+			Description: "Run a bash command or script on a VM and return its combined stdout/stderr and exit status. " +
+				"Runs as the VM's default user in a login shell with no stdin. Output over 64KiB keeps the head and tail.",
+			Annotations: &mcp.ToolAnnotations{DestructiveHint: new(true), OpenWorldHint: new(true)},
+		}, t.runCommand)
+	}
+	if offer(access.OpRestart) {
+		mcp.AddTool(s, &mcp.Tool{
+			Name:        "restart_vm",
+			Description: "Restart an exe.dev VM. Running processes are killed; the disk is kept.",
+			Annotations: &mcp.ToolAnnotations{DestructiveHint: new(true), IdempotentHint: true, OpenWorldHint: new(false)},
+		}, t.restartVM)
+	}
+	if offer(access.OpManage) {
+		mcp.AddTool(s, &mcp.Tool{
+			Name:        "create_vm",
+			Description: "Create a new exe.dev VM. It is ready in seconds. Optionally give an initial task to the Shelley coding agent on the new VM.",
+			Annotations: &mcp.ToolAnnotations{DestructiveHint: new(false), OpenWorldHint: new(false)},
+		}, t.createVM)
+		mcp.AddTool(s, &mcp.Tool{
+			Name:        "delete_vm",
+			Description: "Permanently delete an exe.dev VM and its disk. This cannot be undone.",
+			Annotations: &mcp.ToolAnnotations{DestructiveHint: new(true), IdempotentHint: true, OpenWorldHint: new(false)},
+		}, t.deleteVM)
+		mcp.AddTool(s, &mcp.Tool{
+			Name: "exe_command",
+			Description: "Run any exe.dev lobby command and return its JSON output, e.g. `share show myvm`, `share set-public myvm`, `tag myvm prod`, `resize myvm --disk=50GB`, `help new`. " +
+				"Run `help` to list commands. Which commands are allowed depends on the API token.",
+			Annotations: &mcp.ToolAnnotations{DestructiveHint: new(true), OpenWorldHint: new(false)},
+		}, t.exeCommand)
+	}
 	return s
 }
 
 type toolset struct {
-	c *exe.Client
+	c      *exe.Client
+	policy func(*mcp.CallToolRequest) (access.Policy, error)
+	hostVM string
+}
+
+// policyOf returns the calling connection's policy.
+func (t *toolset) policyOf(req *mcp.CallToolRequest) (access.Policy, error) {
+	if t.policy == nil {
+		return access.Full(), nil
+	}
+	return t.policy(req)
+}
+
+// allows reports whether p covers vm, given its tags.
+func (t *toolset) allows(p access.Policy, vm access.VM) bool {
+	if p.AllVMs {
+		return true
+	}
+	return vm.Name != t.hostVM && p.Allows(vm)
+}
+
+// authorize parses vm and checks the caller may do op on it. Tag-based
+// policies look up the VM's current tags, so untagging a VM revokes
+// access immediately.
+func (t *toolset) authorize(ctx context.Context, req *mcp.CallToolRequest, op access.Op, vm string) (exe.VMName, error) {
+	name, err := exe.ParseVMName(vm)
+	if err != nil {
+		return "", err
+	}
+	p, err := t.policyOf(req)
+	if err != nil {
+		return "", err
+	}
+	if !p.Can(op) {
+		return "", fmt.Errorf("this connection is not allowed to %s (it allows %s)", op, p)
+	}
+	target := access.VM{Name: string(name)}
+	if p.NeedsTags(target.Name) {
+		vms, err := t.ls(ctx)
+		if err != nil {
+			return "", err
+		}
+		for _, v := range vms.all() {
+			if v.Name == target.Name {
+				target.Tags = v.Tags
+			}
+		}
+	}
+	if !t.allows(p, target) {
+		return "", fmt.Errorf("this connection is not allowed to use VM %s (it allows %s)", name, p)
+	}
+	return name, nil
 }
 
 // lobby runs a lobby command with a bounded deadline.
@@ -145,10 +225,18 @@ type listVMsOutput struct {
 	Shared []VM `json:"shared_with_me,omitempty"`
 }
 
-func (t *toolset) listVMs(ctx context.Context, _ *mcp.CallToolRequest, _ listVMsInput) (*mcp.CallToolResult, listVMsOutput, error) {
+// lsOutput is the part of `ls` output the tools use.
+type lsOutput struct {
+	VMs    []VM
+	Shared []VM
+}
+
+func (o lsOutput) all() []VM { return append(slices.Clip(o.VMs), o.Shared...) }
+
+func (t *toolset) ls(ctx context.Context) (lsOutput, error) {
 	raw, err := t.lobby(ctx, "ls")
 	if err != nil {
-		return nil, listVMsOutput{}, err
+		return lsOutput{}, err
 	}
 	type lsVM struct {
 		Name        string   `json:"vm_name"`
@@ -170,7 +258,7 @@ func (t *toolset) listVMs(ctx context.Context, _ *mcp.CallToolRequest, _ listVMs
 		Shared []lsVM `json:"shared_vms"`
 	}
 	if err := json.Unmarshal(raw, &ls); err != nil {
-		return nil, listVMsOutput{}, fmt.Errorf("parse ls output: %w", err)
+		return lsOutput{}, fmt.Errorf("parse ls output: %w", err)
 	}
 	conv := func(in []lsVM) []VM {
 		out := make([]VM, 0, len(in))
@@ -179,7 +267,22 @@ func (t *toolset) listVMs(ctx context.Context, _ *mcp.CallToolRequest, _ listVMs
 		}
 		return out
 	}
-	return nil, listVMsOutput{VMs: conv(ls.VMs), Shared: conv(ls.Shared)}, nil
+	return lsOutput{VMs: conv(ls.VMs), Shared: conv(ls.Shared)}, nil
+}
+
+func (t *toolset) listVMs(ctx context.Context, req *mcp.CallToolRequest, _ listVMsInput) (*mcp.CallToolResult, listVMsOutput, error) {
+	p, err := t.policyOf(req)
+	if err != nil {
+		return nil, listVMsOutput{}, err
+	}
+	ls, err := t.ls(ctx)
+	if err != nil {
+		return nil, listVMsOutput{}, err
+	}
+	visible := func(vms []VM) []VM {
+		return slices.DeleteFunc(vms, func(v VM) bool { return !t.allows(p, access.VM{Name: v.Name, Tags: v.Tags}) })
+	}
+	return nil, listVMsOutput{VMs: visible(ls.VMs), Shared: visible(ls.Shared)}, nil
 }
 
 // --- create_vm
@@ -195,7 +298,10 @@ type createVMInput struct {
 	Prompt  string   `json:"prompt,omitempty" jsonschema:"initial task for the Shelley coding agent on the new VM"`
 }
 
-func (t *toolset) createVM(ctx context.Context, _ *mcp.CallToolRequest, in createVMInput) (*mcp.CallToolResult, any, error) {
+func (t *toolset) createVM(ctx context.Context, req *mcp.CallToolRequest, in createVMInput) (*mcp.CallToolResult, any, error) {
+	if err := t.requireManage(req); err != nil {
+		return nil, nil, err
+	}
 	args := []string{"new"}
 	if in.Name != "" {
 		name, err := exe.ParseVMName(in.Name)
@@ -231,16 +337,19 @@ type vmInput struct {
 	VM string `json:"vm" jsonschema:"VM name"`
 }
 
-func (t *toolset) deleteVM(ctx context.Context, _ *mcp.CallToolRequest, in vmInput) (*mcp.CallToolResult, any, error) {
-	return t.vmLobby(ctx, "rm", in.VM)
+func (t *toolset) deleteVM(ctx context.Context, req *mcp.CallToolRequest, in vmInput) (*mcp.CallToolResult, any, error) {
+	if err := t.requireManage(req); err != nil {
+		return nil, nil, err
+	}
+	return t.vmLobby(ctx, req, access.OpManage, "rm", in.VM)
 }
 
-func (t *toolset) restartVM(ctx context.Context, _ *mcp.CallToolRequest, in vmInput) (*mcp.CallToolResult, any, error) {
-	return t.vmLobby(ctx, "restart", in.VM)
+func (t *toolset) restartVM(ctx context.Context, req *mcp.CallToolRequest, in vmInput) (*mcp.CallToolResult, any, error) {
+	return t.vmLobby(ctx, req, access.OpRestart, "restart", in.VM)
 }
 
-func (t *toolset) vmLobby(ctx context.Context, cmd, vm string) (*mcp.CallToolResult, any, error) {
-	name, err := exe.ParseVMName(vm)
+func (t *toolset) vmLobby(ctx context.Context, req *mcp.CallToolRequest, op access.Op, cmd, vm string) (*mcp.CallToolResult, any, error) {
+	name, err := t.authorize(ctx, req, op, vm)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -257,7 +366,10 @@ type exeCommandInput struct {
 	Command string `json:"command" jsonschema:"lobby command line, as typed after 'ssh exe.dev'"`
 }
 
-func (t *toolset) exeCommand(ctx context.Context, _ *mcp.CallToolRequest, in exeCommandInput) (*mcp.CallToolResult, any, error) {
+func (t *toolset) exeCommand(ctx context.Context, req *mcp.CallToolRequest, in exeCommandInput) (*mcp.CallToolResult, any, error) {
+	if err := t.requireManage(req); err != nil {
+		return nil, nil, err
+	}
 	cmd := strings.TrimSpace(in.Command)
 	cmd = strings.TrimSpace(strings.TrimPrefix(cmd, "ssh exe.dev "))
 	switch {
@@ -271,4 +383,16 @@ func (t *toolset) exeCommand(ctx context.Context, _ *mcp.CallToolRequest, in exe
 		return nil, nil, err
 	}
 	return jsonResult(raw), nil, nil
+}
+
+// requireManage guards the account-level tools that name no VM.
+func (t *toolset) requireManage(req *mcp.CallToolRequest) error {
+	p, err := t.policyOf(req)
+	if err != nil {
+		return err
+	}
+	if !p.AllVMs || !p.Can(access.OpManage) {
+		return fmt.Errorf("this connection is not allowed to manage VMs (it allows %s)", p)
+	}
+	return nil
 }

@@ -130,6 +130,7 @@ func (s *Server) exchangeCode(clientID ClientID, code, redirectURI, verifier str
 		RedirectHost:     redirectHost(c.redirectURI),
 		Email:            c.email,
 		Scopes:           c.scopes,
+		Access:           c.access,
 		CreatedAt:        now,
 		RefreshedAt:      now,
 		RefreshHash:      hashToken(refresh),

@@ -79,7 +79,38 @@ page then asks you to allow the client.
 The connector also works in Claude Code:
 `claude mcp add --transport http exe https://my-mcp.exe.xyz/mcp`.
 
-The dashboard at `https://my-mcp.exe.xyz/` shows the connector URL, checks that the API integration works and which account it acts as, and lists connected applications so you can revoke them.
+The dashboard at `https://my-mcp.exe.xyz/` shows the connector URL, checks that the API integration works and which account it acts as, and lists connected applications with their access so you can revoke them.
+
+### Access per connection
+
+When you connect an application, the consent page asks which VMs and
+operations it may use. By default it gets everything.
+
+**VMs:** all of them, a list you pick, or any VM carrying one of the tags you
+pick. A tag covers VMs tagged later, and untagging a VM cuts off access on the
+next call.
+
+**Operations:**
+
+| Operation | Tools |
+|---|---|
+| read files | `read_file` |
+| write files | `write_file`, `edit_file` |
+| run commands | `run_command` |
+| restart | `restart_vm` |
+| create & delete VMs | `create_vm`, `delete_vm`, `exe_command`; all VMs only |
+
+`list_vms` is always available and shows only the allowed VMs. A connection
+sees only the tools it may use, and access is checked again on every call.
+For example, read files on the `prod` tag gives a read-only view of
+production. To change a connection's access, revoke it and connect again.
+
+Note that run commands implies the rest on the same VM: a shell can read and
+write files and reboot the machine. Leave it off for real read-only access.
+
+The VM running the server is only available with all VMs. It holds the
+API integration, so running commands there reaches the whole account. The
+same is true of any other VM you attach the integration to.
 
 `serve` reads its VM name and owner from the exe.dev Reflection integration.
 Overrides go in `~/.config/exe-mcp/env` on the VM:
@@ -91,6 +122,7 @@ Overrides go in `~/.config/exe-mcp/env` on the VM:
 | `--owner` | `EXE_MCP_OWNER` | the VM owner's email; repeat the flag or comma-separate the env var to allow more |
 | `--exec-url` | `EXE_MCP_EXEC_URL` | `https://exe-api.int.exe.xyz/exec` |
 | `--state` | `EXE_MCP_STATE` | `~/.config/exe-mcp/oauth.json` |
+| `--vm-name` | `EXE_MCP_VM_NAME` | this VM's name; only offered to full-access connections |
 
 ## Tools
 
@@ -99,11 +131,11 @@ Overrides go in `~/.config/exe-mcp/env` on the VM:
 | `list_vms` | VMs you own and VMs shared with you |
 | `create_vm` | Optional name, image, CPUs, memory, disk, tags, comment, and a first task for Shelley |
 | `delete_vm`, `restart_vm` | |
+| `exe_command` | Any other exe.dev lobby command the token allows |
 | `run_command` | Runs in a bash login shell, with a timeout (default 2m, max 10m) and optional cwd. Output is capped at 64KB; beyond that the middle is dropped |
 | `read_file` | Line-numbered, with offset and limit |
 | `write_file` | Atomic (temp file, then rename); keeps the existing mode |
 | `edit_file` | Exact string replacement that must match once, or pass `replace_all` |
-| `exe_command` | Any other exe.dev lobby command the token allows |
 
 ## Security
 

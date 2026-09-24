@@ -28,6 +28,8 @@ import (
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/auth"
+
+	"github.com/broady/exedev-mcp/internal/access"
 )
 
 // Scope is the single scope this server issues: full access to the owner's
@@ -66,7 +68,14 @@ type Config struct {
 	// dashboard shows it, so a broken or mismatched API integration is
 	// visible at a glance.
 	Account func(ctx context.Context) (email string, err error)
-	Logger  *slog.Logger
+	// VMs lists the account's VMs, for choosing what a connection may use.
+	// If nil or failing, the consent page offers full access only.
+	VMs func(ctx context.Context) ([]access.VM, error)
+	// HostVM is the VM the server runs on. It is not offered to limited
+	// connections: it holds the API integration, so commands there have
+	// full access (tools.Options.HostVM enforces this).
+	HostVM string
+	Logger *slog.Logger
 }
 
 // Server is the authorization server and token verifier.
@@ -77,6 +86,8 @@ type Server struct {
 	statePath    string
 	trustedHosts []string
 	account      func(context.Context) (string, error)
+	listVMs      func(context.Context) ([]access.VM, error)
+	hostVM       string
 	log          *slog.Logger
 	fetcher      *http.Client
 	now          func() time.Time
@@ -97,6 +108,9 @@ type pendingAuthorization struct {
 	scopes        []string
 	email         string
 	expires       time.Time
+	// choices are the VMs and tags offered on the consent page.
+	choices  []access.VM
+	vmsError string
 }
 
 type authorizationCode struct {
@@ -105,6 +119,7 @@ type authorizationCode struct {
 	redirectURI   string
 	codeChallenge string
 	scopes        []string
+	access        access.Policy
 	email         string
 	expires       time.Time
 }
@@ -141,6 +156,8 @@ func New(cfg Config) (*Server, error) {
 		statePath:    cfg.StatePath,
 		trustedHosts: lowerAll(trusted),
 		account:      cfg.Account,
+		listVMs:      cfg.VMs,
+		hostVM:       cfg.HostVM,
 		log:          logger,
 		fetcher:      newMetadataFetcher(),
 		now:          time.Now,
@@ -191,8 +208,21 @@ func (s *Server) Register(mux *http.ServeMux) {
 	mux.HandleFunc("OPTIONS /oauth/{endpoint}", preflight)
 	mux.HandleFunc("OPTIONS /.well-known/{doc...}", preflight)
 	mux.HandleFunc("GET /{$}", s.dashboard)
-	mux.Handle("GET /oauth/grants", http.RedirectHandler("/", http.StatusMovedPermanently)) // pre-dashboard URL
 	mux.Handle("POST /oauth/grants/revoke", s.cop.Handler(http.HandlerFunc(s.revoke)))
+}
+
+// accessKey holds the grant's access.Policy in auth.TokenInfo.Extra.
+const accessKey = "exe-mcp/access"
+
+// PolicyOf returns the access policy that Verify attached to info. It
+// fails closed: no token, or a token from another verifier, allows nothing.
+func PolicyOf(info *auth.TokenInfo) (access.Policy, error) {
+	if info != nil {
+		if p, ok := info.Extra[accessKey].(access.Policy); ok {
+			return p, nil
+		}
+	}
+	return access.Policy{}, errors.New("no access policy for this request")
 }
 
 // Verify is an auth.TokenVerifier for the MCP endpoint.
@@ -215,7 +245,15 @@ func (s *Server) Verify(_ context.Context, token string, _ *http.Request) (*auth
 	case !slices.Contains(s.owners, g.Email):
 		return nil, fmt.Errorf("%w: %s is no longer an owner", auth.ErrInvalidToken, g.Email)
 	}
-	return &auth.TokenInfo{Scopes: slices.Clone(g.Scopes), Expiration: c.expires, UserID: g.Email}, nil
+	if now := s.now(); now.Sub(g.UsedAt) >= usedResolution {
+		g.UsedAt = now
+		// Failing to record use must not fail the request; saveLocked logs.
+		_ = s.saveLocked()
+	}
+	return &auth.TokenInfo{
+		Scopes: slices.Clone(g.Scopes), Expiration: c.expires, UserID: g.Email,
+		Extra: map[string]any{accessKey: g.Access.Clone()},
+	}, nil
 }
 
 // identity returns the authenticated owner's email, or writes a response
@@ -271,6 +309,10 @@ func (s *Server) matchesResource(res string) bool {
 	res = strings.TrimSuffix(res, "/")
 	return res == s.resource || res == s.issuer
 }
+
+// usedResolution bounds how often Verify writes the state file to record
+// a grant's last use: at most once per grant per interval.
+const usedResolution = time.Minute
 
 // saveLocked persists state. s.mu must be held.
 func (s *Server) saveLocked() error {

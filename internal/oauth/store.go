@@ -12,6 +12,8 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/broady/exedev-mcp/internal/access"
 )
 
 // ClientID identifies an OAuth client: either an https URL (a Client ID
@@ -50,14 +52,20 @@ type registeredClient struct {
 // refresh token (hashed) and the previous one, so reuse of a rotated-out
 // token can be detected and the grant revoked.
 type grant struct {
-	ID               GrantID   `json:"id"`
-	ClientID         ClientID  `json:"client_id"`
-	ClientName       string    `json:"client_name"`
-	RedirectHost     string    `json:"redirect_host"`
-	Email            string    `json:"email"`
-	Scopes           []string  `json:"scopes"`
-	CreatedAt        time.Time `json:"created_at"`
-	RefreshedAt      time.Time `json:"refreshed_at"`
+	ID           GrantID  `json:"id"`
+	ClientID     ClientID `json:"client_id"`
+	ClientName   string   `json:"client_name"`
+	RedirectHost string   `json:"redirect_host"`
+	Email        string   `json:"email"`
+	Scopes       []string `json:"scopes"`
+	// Access is what the user allowed on the consent page. It is checked
+	// on every tool call, so edits apply to live tokens.
+	Access      access.Policy `json:"access"`
+	CreatedAt   time.Time     `json:"created_at"`
+	RefreshedAt time.Time     `json:"refreshed_at"`
+	// UsedAt is when an access token was last presented, to within
+	// usedResolution.
+	UsedAt           time.Time `json:"used_at,omitzero"`
 	RefreshHash      tokenHash `json:"refresh_hash"`
 	PrevRefreshHash  tokenHash `json:"prev_refresh_hash,omitempty"`
 	RefreshExpiresAt time.Time `json:"refresh_expires_at"`

@@ -10,6 +10,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/broady/exedev-mcp/internal/access"
 	"github.com/broady/exedev-mcp/internal/exe"
 )
 
@@ -22,8 +23,8 @@ type runCommandInput struct {
 	TimeoutSeconds int    `json:"timeout_seconds,omitempty" jsonschema:"kill the command after this many seconds (default 120, max 600)"`
 }
 
-func (t *toolset) runCommand(ctx context.Context, _ *mcp.CallToolRequest, in runCommandInput) (*mcp.CallToolResult, any, error) {
-	vm, err := exe.ParseVMName(in.VM)
+func (t *toolset) runCommand(ctx context.Context, req *mcp.CallToolRequest, in runCommandInput) (*mcp.CallToolResult, any, error) {
+	vm, err := t.authorize(ctx, req, access.OpRun, in.VM)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -65,8 +66,8 @@ type readFileInput struct {
 	Limit  int    `json:"limit,omitempty" jsonschema:"maximum number of lines (default 2000)"`
 }
 
-func (t *toolset) readFile(ctx context.Context, _ *mcp.CallToolRequest, in readFileInput) (*mcp.CallToolResult, any, error) {
-	vm, err := exe.ParseVMName(in.VM)
+func (t *toolset) readFile(ctx context.Context, req *mcp.CallToolRequest, in readFileInput) (*mcp.CallToolResult, any, error) {
+	vm, err := t.authorize(ctx, req, access.OpRead, in.VM)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -105,8 +106,8 @@ type writeFileInput struct {
 	Content string `json:"content" jsonschema:"full file content"`
 }
 
-func (t *toolset) writeFile(ctx context.Context, _ *mcp.CallToolRequest, in writeFileInput) (*mcp.CallToolResult, any, error) {
-	vm, err := exe.ParseVMName(in.VM)
+func (t *toolset) writeFile(ctx context.Context, req *mcp.CallToolRequest, in writeFileInput) (*mcp.CallToolResult, any, error) {
+	vm, err := t.authorize(ctx, req, access.OpWrite, in.VM)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -176,8 +177,8 @@ type editFileInput struct {
 	ReplaceAll bool   `json:"replace_all,omitempty" jsonschema:"replace every occurrence instead of requiring exactly one"`
 }
 
-func (t *toolset) editFile(ctx context.Context, _ *mcp.CallToolRequest, in editFileInput) (*mcp.CallToolResult, any, error) {
-	vm, err := exe.ParseVMName(in.VM)
+func (t *toolset) editFile(ctx context.Context, req *mcp.CallToolRequest, in editFileInput) (*mcp.CallToolResult, any, error) {
+	vm, err := t.authorize(ctx, req, access.OpWrite, in.VM)
 	if err != nil {
 		return nil, nil, err
 	}
