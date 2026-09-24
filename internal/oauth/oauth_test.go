@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"net/url"
+	"os"
 	"path/filepath"
 	"reflect"
 	"regexp"
@@ -815,7 +816,7 @@ func TestConsentOffersVMsAndTags(t *testing.T) {
 	id := h.register(claudeCB)
 	_, challenge := pkce()
 	page := readAll(h.do("GET", h.authorizeURL(authzParams{clientID: id, redirect: claudeCB, challenge: challenge}), owner, nil, nil))
-	for _, want := range []string{`name="vm" value="web"`, `name="vm" value="dev"`, `name="tag" value="prod"`, `id="scope-all" checked`, `id="scope-tags"`, `name="op" value="read" checked`, `name="op" value="manage" checked`} {
+	for _, want := range []string{`name="vm" value="web"`, `name="vm" value="dev"`, `name="tag" value="prod"`, `id="scope-all" checked`, `id="scope-tags"`, `name="op" value="read" checked`, `name="op" value="manage" checked`, `name="op" value="share" checked`, `name="op" value="expose">`} {
 		if !strings.Contains(page, want) {
 			t.Errorf("consent page missing %s", want)
 		}
@@ -979,5 +980,40 @@ func TestAgo(t *testing.T) {
 		if got := ago(now, tc.t); got != tc.want {
 			t.Errorf("ago(%v) = %q, want %q", tc.t, got, tc.want)
 		}
+	}
+}
+
+// Version 1 connections that could manage VMs shared them through
+// exe_command; after the upgrade they keep that through share_vm.
+func TestMigrateV1GrantsKeepSharing(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "oauth.json")
+	v1 := `{"version":1,"clients":{},"grants":{
+		"full":{"id":"full","access":{"all_vms":true,"ops":["read","write","run","restart","manage"]}},
+		"all-no-manage":{"id":"all-no-manage","access":{"all_vms":true,"ops":["read"]}},
+		"limited":{"id":"limited","access":{"vms":["dev"],"ops":["run"]}}}}`
+	if err := os.WriteFile(path, []byte(v1), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	st, err := loadState(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Version != stateVersion {
+		t.Errorf("version = %d, want %d", st.Version, stateVersion)
+	}
+	for id, want := range map[GrantID][]access.Op{
+		"full":          access.Ops(),
+		"all-no-manage": {access.OpRead},
+		"limited":       {access.OpRun},
+	} {
+		if got := st.Grants[id].Access.Ops; !slices.Equal(got, want) {
+			t.Errorf("%s: ops = %v, want %v", id, got, want)
+		}
+	}
+	if err := os.WriteFile(path, []byte(`{"version":3}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadState(path); err == nil {
+		t.Error("future version: want error")
 	}
 }

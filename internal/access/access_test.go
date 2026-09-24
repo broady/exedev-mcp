@@ -17,7 +17,7 @@ func TestPolicy(t *testing.T) {
 		tagsForDev bool
 	}{
 		{"zero", Policy{}, false, false, false, "no VMs: list only", false},
-		{"full", Full(), true, true, true, "all VMs: read, write, run, restart, manage", false},
+		{"full", Full(), true, true, true, "all VMs: read, write, run, restart, share, expose, manage", false},
 		{"all VMs with extras", Policy{AllVMs: true, VMs: []string{"web"}}, false, true, true, "all VMs: list only", false},
 		{"by name", Policy{VMs: []string{"dev"}, Ops: []Op{OpRead}}, true, false, true, "dev: read", false},
 		{"by tag", Policy{Tags: []string{"prod"}}, true, true, false, "tag:prod: list only", true},

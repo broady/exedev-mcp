@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -100,6 +101,15 @@ func NewServer(c *exe.Client, version string, opts Options) *mcp.Server {
 			Annotations: &mcp.ToolAnnotations{DestructiveHint: new(true), IdempotentHint: true, OpenWorldHint: new(false)},
 		}, t.restartVM)
 	}
+	if offer(access.OpShare) || offer(access.OpExpose) {
+		mcp.AddTool(s, &mcp.Tool{
+			Name: "share_vm",
+			Description: "Show or change who can reach a VM. show lists its shares; add and remove share its web (https://<vm>.exe.xyz) with a user or team; " +
+				"add with shell also grants SSH, terminal and Shelley; add-link creates a link anyone can use; set-public and set-private open or close the web to everyone; " +
+				"port sets the proxied port; receive-email turns inbound email on or off.",
+			Annotations: &mcp.ToolAnnotations{DestructiveHint: new(true), OpenWorldHint: new(true)},
+		}, t.shareVM)
+	}
 	if offer(access.OpManage) {
 		mcp.AddTool(s, &mcp.Tool{
 			Name:        "create_vm",
@@ -113,8 +123,8 @@ func NewServer(c *exe.Client, version string, opts Options) *mcp.Server {
 		}, t.deleteVM)
 		mcp.AddTool(s, &mcp.Tool{
 			Name: "exe_command",
-			Description: "Run any exe.dev lobby command and return its JSON output, e.g. `share show myvm`, `share set-public myvm`, `tag myvm prod`, `resize myvm --disk=50GB`, `help new`. " +
-				"Run `help` to list commands. Which commands are allowed depends on the API token.",
+			Description: "Run any other exe.dev lobby command and return its JSON output, e.g. `tag myvm prod`, `resize myvm --disk=50GB`, `help new`. " +
+				"Run `help` to list commands. Which commands are allowed depends on the API token. Use share_vm for sharing and run_command for ssh.",
 			Annotations: &mcp.ToolAnnotations{DestructiveHint: new(true), OpenWorldHint: new(false)},
 		}, t.exeCommand)
 	}
@@ -362,6 +372,12 @@ func (t *toolset) vmLobby(ctx context.Context, req *mcp.CallToolRequest, op acce
 
 // --- exe_command
 
+// lobbyCommandRE matches the command name at the start of a lobby command
+// line. Commands owned by other tools are refused by name, which is only
+// sound if every lexer agrees on that name, so the name must be a bare word:
+// no quotes, escapes or uppercase that the lobby might read differently.
+var lobbyCommandRE = regexp.MustCompile(`^[a-z][a-z0-9-]*(?:\s|$)`)
+
 type exeCommandInput struct {
 	Command string `json:"command" jsonschema:"lobby command line, as typed after 'ssh exe.dev'"`
 }
@@ -372,11 +388,17 @@ func (t *toolset) exeCommand(ctx context.Context, req *mcp.CallToolRequest, in e
 	}
 	cmd := strings.TrimSpace(in.Command)
 	cmd = strings.TrimSpace(strings.TrimPrefix(cmd, "ssh exe.dev "))
-	switch {
-	case cmd == "":
+	if cmd == "" {
 		return nil, nil, errors.New("command is required")
-	case cmd == "ssh" || strings.HasPrefix(cmd, "ssh "):
+	}
+	name := strings.TrimSpace(lobbyCommandRE.FindString(cmd))
+	switch name {
+	case "":
+		return nil, nil, fmt.Errorf("command must start with a plain lowercase command name, got %q", cmd)
+	case "ssh":
 		return nil, nil, errors.New("use run_command to run commands on a VM")
+	case "share":
+		return nil, nil, errors.New("use share_vm to change sharing")
 	}
 	raw, err := t.lobby(ctx, cmd)
 	if err != nil {

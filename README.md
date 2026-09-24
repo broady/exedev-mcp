@@ -104,7 +104,7 @@ The dashboard at `https://my-mcp.exe.xyz/` shows the connector URL, checks that 
 ### Access per connection
 
 When you connect an application, the consent page asks which VMs and
-operations it may use. By default it gets everything.
+operations it may use. By default it gets everything except expose.
 
 **VMs:** all of them, a list you pick, or any VM carrying one of the tags you
 pick. A tag covers VMs tagged later, and untagging a VM cuts off access on the
@@ -118,6 +118,8 @@ next call.
 | write files | `write_file`, `edit_file` |
 | run commands | `run_command` |
 | restart | `restart_vm` |
+| share with people | `share_vm`: show shares, share the web with a user or team, set private, remove users and links |
+| make public & grant shell | `share_vm`: also set public, create share links, grant shell access, change the port, turn on inbound email |
 | create & delete VMs | `create_vm`, `delete_vm`, `exe_command`; all VMs only |
 
 `list_vms` is always available and shows only the allowed VMs. A connection
@@ -127,6 +129,7 @@ production. To change a connection's access, revoke it and connect again.
 
 Note that run commands implies the rest on the same VM: a shell can read and
 write files and reboot the machine. Leave it off for real read-only access.
+Make public & grant shell implies share with people.
 
 The VM running the server is only available with all VMs. It holds the
 API integration, so running commands there reaches the whole account. The
@@ -151,7 +154,8 @@ Overrides go in `~/.config/exe-mcp/env` on the VM:
 | `list_vms` | VMs you own and VMs shared with you |
 | `create_vm` | Optional name, image, CPUs, memory, disk, tags, comment, and a first task for Shelley |
 | `delete_vm`, `restart_vm` | |
-| `exe_command` | Any other exe.dev lobby command the token allows |
+| `share_vm` | Show or change a VM's sharing: `show`, `add`, `remove`, `add-link`, `remove-link`, `set-public`, `set-private`, `port`, `receive-email`. Only `show` works on the server's own VM |
+| `exe_command` | Any other exe.dev lobby command the token allows, except `ssh` and `share`, which only `run_command` and `share_vm` can reach |
 | `run_command` | Runs in a bash login shell, with a timeout (default 2m, max 10m) and optional cwd. Output is capped at 64KB; beyond that the middle is dropped |
 | `read_file` | Line-numbered, with offset and limit |
 | `write_file` | Atomic (temp file, then rename); keeps the existing mode |

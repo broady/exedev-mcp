@@ -52,6 +52,8 @@ var opLabels = map[access.Op]string{
 	access.OpWrite:   "write files",
 	access.OpRun:     "run commands",
 	access.OpRestart: "restart",
+	access.OpShare:   "share with people",
+	access.OpExpose:  "make public & grant shell",
 	access.OpManage:  "create & delete VMs",
 }
 

@@ -19,13 +19,20 @@ const (
 	OpWrite   Op = "write"   // write_file, edit_file
 	OpRun     Op = "run"     // run_command
 	OpRestart Op = "restart" // restart_vm
+	// OpShare lets share_vm show a VM's shares, share its web with named
+	// users, and take any access away.
+	OpShare Op = "share"
+	// OpExpose lets share_vm widen access beyond named web users: make the
+	// VM public, create share links, grant shell access, change the proxy
+	// port and turn on inbound email. It implies OpShare.
+	OpExpose Op = "expose"
 	// OpManage acts on the account rather than one VM: create_vm,
 	// delete_vm, exe_command. It requires AllVMs.
 	OpManage Op = "manage"
 )
 
 // Ops lists every operation in display order.
-func Ops() []Op { return []Op{OpRead, OpWrite, OpRun, OpRestart, OpManage} }
+func Ops() []Op { return []Op{OpRead, OpWrite, OpRun, OpRestart, OpShare, OpExpose, OpManage} }
 
 // Policy limits a connection. The zero value allows nothing but listing.
 type Policy struct {
@@ -90,8 +97,11 @@ func NormalizeOps(ops []Op) []Op {
 	return slices.DeleteFunc(Ops(), func(op Op) bool { return !slices.Contains(ops, op) })
 }
 
-// Can reports whether p allows op.
-func (p Policy) Can(op Op) bool { return slices.Contains(p.Ops, op) }
+// Can reports whether p allows op. OpExpose implies OpShare: anything that
+// can make a VM public may as well share it with one person.
+func (p Policy) Can(op Op) bool {
+	return slices.Contains(p.Ops, op) || op == OpShare && slices.Contains(p.Ops, OpExpose)
+}
 
 // Allows reports whether p covers vm.
 func (p Policy) Allows(vm VM) bool {

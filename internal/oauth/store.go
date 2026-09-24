@@ -86,7 +86,8 @@ type state struct {
 	Grants    map[GrantID]*grant             `json:"grants"`
 }
 
-const stateVersion = 1
+// stateVersion 2 added the share and expose operations; see migrate.
+const stateVersion = 2
 
 func emptyState() *state {
 	return &state{
@@ -108,9 +109,10 @@ func loadState(path string) (*state, error) {
 	if err := json.Unmarshal(b, st); err != nil {
 		return nil, fmt.Errorf("parse state %s: %w", path, err)
 	}
-	if st.Version != stateVersion {
+	if st.Version < 1 || st.Version > stateVersion {
 		return nil, fmt.Errorf("state %s: unsupported version %d", path, st.Version)
 	}
+	st.migrate()
 	if st.Clients == nil {
 		st.Clients = map[ClientID]*registeredClient{}
 	}
@@ -118,6 +120,20 @@ func loadState(path string) (*state, error) {
 		st.Grants = map[GrantID]*grant{}
 	}
 	return st, nil
+}
+
+// migrate upgrades st to stateVersion in memory; the next save persists it.
+func (st *state) migrate() {
+	if st.Version < 2 {
+		// Before share_vm, connections that could manage VMs shared them
+		// through exe_command, which now refuses share. Keep what they had.
+		for _, g := range st.Grants {
+			if g.Access.AllVMs && g.Access.Can(access.OpManage) {
+				g.Access.Ops = access.NormalizeOps(append(g.Access.Ops, access.OpShare, access.OpExpose))
+			}
+		}
+	}
+	st.Version = stateVersion
 }
 
 // saveState writes st atomically: temp file, fsync, rename, fsync dir.

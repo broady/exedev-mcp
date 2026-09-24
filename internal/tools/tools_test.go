@@ -103,7 +103,7 @@ func (f *fakeExe) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case body == "ls":
 		io.WriteString(w, `{"vms":[{"vm_name":"testvm","status":"running","https_url":"https://testvm.exe.xyz","ssh_dest":"testvm.exe.xyz","tags":["a"],"allocated_cpus":2},{"vm_name":"other","tags":["b"]},{"vm_name":"host","tags":["a"]}],"shared_vms":[{"vm_name":"theirs","status":"running","owner_email":"x@y.z"}]}`)
-	case strings.HasPrefix(body, "new"), strings.HasPrefix(body, "rm "), strings.HasPrefix(body, "share show"):
+	case strings.HasPrefix(body, "new"), strings.HasPrefix(body, "rm "), strings.HasPrefix(body, "share "):
 		io.WriteString(w, `{"ok":true}`)
 	default:
 		w.WriteHeader(404)
@@ -173,15 +173,28 @@ func TestCreateVMQuotesArgs(t *testing.T) {
 
 func TestExeCommand(t *testing.T) {
 	f, cs := newFakeExe(t)
-	out, isErr := call(t, cs, "exe_command", map[string]any{"command": "ssh exe.dev share show testvm"})
-	if isErr || out != `{"ok":true}` || f.lastLobby() != "share show testvm" {
+	out, isErr := call(t, cs, "exe_command", map[string]any{"command": "ssh exe.dev rm testvm"})
+	if isErr || out != `{"ok":true}` || f.lastLobby() != "rm testvm" {
 		t.Errorf("got %q (err=%v), lobby %q", out, isErr, f.lastLobby())
 	}
 	if out, isErr := call(t, cs, "exe_command", map[string]any{"command": "bogus"}); !isErr || !strings.Contains(out, "unknown command") {
 		t.Errorf("unknown command: %q %v", out, isErr)
 	}
-	if _, isErr := call(t, cs, "exe_command", map[string]any{"command": "ssh testvm ls"}); !isErr {
-		t.Error("ssh via exe_command: want error")
+	if call(t, cs, "exe_command", map[string]any{"command": "help share"}); f.lastLobby() != "help share" {
+		t.Errorf("help share: lobby %q, want it passed through", f.lastLobby())
+	}
+	// Refused before reaching the lobby: commands other tools own, and any
+	// spelling of a command name the lobby might lex differently.
+	for _, cmd := range []string{
+		"ssh testvm ls", "ssh", "share set-public testvm", "ssh exe.dev share add testvm a@b.c",
+		"'share' set-public testvm", `sh""are set-public testvm`, `\share set-public testvm`, "SHARE set-public testvm", "--json share show testvm",
+	} {
+		f.mu.Lock()
+		f.lobby = nil
+		f.mu.Unlock()
+		if _, isErr := call(t, cs, "exe_command", map[string]any{"command": cmd}); !isErr || f.lastLobby() != "" {
+			t.Errorf("exe_command %q: want refused without a lobby call", cmd)
+		}
 	}
 }
 
@@ -399,7 +412,9 @@ func TestOpsSelectTools(t *testing.T) {
 		ops  []access.Op
 		want string
 	}{
-		{nil, "create_vm,delete_vm,edit_file,exe_command,list_vms,read_file,restart_vm,run_command,write_file"},
+		{nil, "create_vm,delete_vm,edit_file,exe_command,list_vms,read_file,restart_vm,run_command,share_vm,write_file"},
+		{[]access.Op{access.OpShare}, "list_vms,share_vm"},
+		{[]access.Op{access.OpExpose}, "list_vms,share_vm"},
 		{[]access.Op{}, "list_vms"},
 		{[]access.Op{access.OpRead}, "list_vms,read_file"},
 		{[]access.Op{access.OpWrite, access.OpRun}, "edit_file,list_vms,run_command,write_file"},
@@ -424,5 +439,63 @@ func TestFullAccessSeesHost(t *testing.T) {
 	_, cs := newFakeExeWith(t, Options{Policy: fixedPolicy(access.Full()), HostVM: "host"})
 	if got := strings.Join(listedVMs(t, cs), ","); got != "testvm,other,host,theirs" {
 		t.Errorf("list_vms = %s", got)
+	}
+}
+
+func TestShareVM(t *testing.T) {
+	share := []access.Op{access.OpShare}
+	expose := []access.Op{access.OpExpose}
+	for _, tc := range []struct {
+		name string
+		ops  []access.Op
+		args map[string]any
+		want string // lobby command, or "" for refused
+	}{
+		{"show", share, map[string]any{"action": "show"}, "share show testvm"},
+		{"add web", share, map[string]any{"action": "add", "who": "a@b.c", "message": "it's up"}, `share add testvm a@b.c '--message=it'\''s up'`},
+		{"add team", share, map[string]any{"action": "add", "who": "team"}, "share add testvm team"},
+		{"add shell needs expose", share, map[string]any{"action": "add", "who": "a@b.c", "shell": true}, ""},
+		{"add shell", expose, map[string]any{"action": "add", "who": "a@b.c", "shell": true}, "share add testvm a@b.c --root"},
+		{"remove shell", share, map[string]any{"action": "remove", "who": "a@b.c", "shell": true}, "share remove testvm a@b.c --root"},
+		{"who is not a flag", expose, map[string]any{"action": "add", "who": "--root"}, ""},
+		{"who is one word", expose, map[string]any{"action": "add", "who": "a@b.c --root"}, ""},
+		{"who required", share, map[string]any{"action": "remove"}, ""},
+		{"message only on add", share, map[string]any{"action": "remove", "who": "a@b.c", "message": "x"}, ""},
+		{"set-private", share, map[string]any{"action": "set-private"}, "share set-private testvm"},
+		{"set-public needs expose", share, map[string]any{"action": "set-public"}, ""},
+		{"set-public", expose, map[string]any{"action": "set-public"}, "share set-public testvm"},
+		{"add-link needs expose", share, map[string]any{"action": "add-link"}, ""},
+		{"remove-link", share, map[string]any{"action": "remove-link", "link": "abc_123"}, "share remove-link testvm abc_123"},
+		{"remove-link validates", share, map[string]any{"action": "remove-link", "link": "-x"}, ""},
+		{"show port", share, map[string]any{"action": "port"}, "share port testvm"},
+		{"set port needs expose", share, map[string]any{"action": "port", "port": 8080}, ""},
+		{"set port", expose, map[string]any{"action": "port", "port": 8080}, "share port testvm 8080"},
+		{"bad port", expose, map[string]any{"action": "port", "port": 70000}, ""},
+		{"email on needs expose", share, map[string]any{"action": "receive-email", "enabled": true}, ""},
+		{"email off", share, map[string]any{"action": "receive-email", "enabled": false}, "share receive-email testvm off"},
+		{"email on", expose, map[string]any{"action": "receive-email", "enabled": true}, "share receive-email testvm on"},
+		{"unknown action", expose, map[string]any{"action": "domain"}, ""},
+		{"no share op", []access.Op{access.OpRun}, map[string]any{"action": "show"}, ""},
+	} {
+		f, cs := newFakeExeWith(t, Options{Policy: fixedPolicy(access.Policy{VMs: []string{"testvm"}, Ops: tc.ops})})
+		tc.args["vm"] = "testvm"
+		_, isErr := call(t, cs, "share_vm", tc.args)
+		if got := f.lastLobby(); got != tc.want || isErr != (tc.want == "") {
+			t.Errorf("%s: lobby %q (err=%v), want %q", tc.name, got, isErr, tc.want)
+		}
+	}
+}
+
+func TestShareVMHost(t *testing.T) {
+	f, cs := newFakeExeWith(t, Options{Policy: fixedPolicy(access.Full()), HostVM: "host"})
+	if _, isErr := call(t, cs, "share_vm", map[string]any{"vm": "host", "action": "set-private"}); !isErr || f.lastLobby() != "" {
+		t.Errorf("set-private on host: err=%v, lobby %q", isErr, f.lastLobby())
+	}
+	if _, isErr := call(t, cs, "share_vm", map[string]any{"vm": "host", "action": "show"}); isErr || f.lastLobby() != "share show host" {
+		t.Errorf("show on host: err=%v, lobby %q", isErr, f.lastLobby())
+	}
+	_, cs = newFakeExeWith(t, Options{Policy: fixedPolicy(access.Policy{Tags: []string{"a"}, Ops: []access.Op{access.OpShare}}), HostVM: "host"})
+	if _, isErr := call(t, cs, "share_vm", map[string]any{"vm": "host", "action": "show"}); !isErr {
+		t.Error("show on host by tag: want refused")
 	}
 }

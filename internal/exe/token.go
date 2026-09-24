@@ -22,12 +22,13 @@ import (
 const APINamespace = "v0@exe.dev"
 
 // DefaultCmds returns the lobby commands a minted token may run: VM
-// lifecycle, inspection, sharing, and ssh into any VM. Billing, team, key
+// lifecycle, inspection, sharing (for share_vm), and ssh into any VM. Billing, team, key
 // and integration management are deliberately excluded.
 func DefaultCmds() []string {
 	return []string{
 		"help", "ls", "new", "rm", "restart", "rename", "tag", "comment", "stat", "whoami",
 		"ssh", "share show", "share port", "share set-public", "share set-private",
+		"share add", "share remove", "share add-link", "share remove-link", "share receive-email",
 	}
 }
 

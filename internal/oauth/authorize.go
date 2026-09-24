@@ -117,7 +117,14 @@ type choice struct {
 }
 
 // defaultChoice is what the consent page starts with: everything.
-func defaultChoice() choice { return choice{scope: "all", policy: access.Full()} }
+// defaultChoice is what the consent page offers first: everything but
+// expose, which can hand a VM to the internet or to someone else's shell
+// and so is always an explicit choice.
+func defaultChoice() choice {
+	p := access.Full()
+	p.Ops = slices.DeleteFunc(p.Ops, func(op access.Op) bool { return op == access.OpExpose })
+	return choice{scope: "all", policy: p}
+}
 
 // consentPage renders p. c and formErr carry a submission back to the
 // user.
