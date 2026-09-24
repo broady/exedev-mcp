@@ -62,7 +62,11 @@ type Config struct {
 	// TrustedClientHosts are client_id hosts whose metadata documents are
 	// shown as verified on the consent page. Defaults to claude.ai.
 	TrustedClientHosts []string
-	Logger             *slog.Logger
+	// Account, if set, reports the exe.dev account the server acts as. The
+	// dashboard shows it, so a broken or mismatched API integration is
+	// visible at a glance.
+	Account func(ctx context.Context) (email string, err error)
+	Logger  *slog.Logger
 }
 
 // Server is the authorization server and token verifier.
@@ -72,6 +76,7 @@ type Server struct {
 	owners       []string
 	statePath    string
 	trustedHosts []string
+	account      func(context.Context) (string, error)
 	log          *slog.Logger
 	fetcher      *http.Client
 	now          func() time.Time
@@ -135,6 +140,7 @@ func New(cfg Config) (*Server, error) {
 		owners:       lowerAll(cfg.Owners),
 		statePath:    cfg.StatePath,
 		trustedHosts: lowerAll(trusted),
+		account:      cfg.Account,
 		log:          logger,
 		fetcher:      newMetadataFetcher(),
 		now:          time.Now,
@@ -184,7 +190,8 @@ func (s *Server) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /oauth/register", s.registerClient)
 	mux.HandleFunc("OPTIONS /oauth/{endpoint}", preflight)
 	mux.HandleFunc("OPTIONS /.well-known/{doc...}", preflight)
-	mux.HandleFunc("GET /oauth/grants", s.grants)
+	mux.HandleFunc("GET /{$}", s.dashboard)
+	mux.Handle("GET /oauth/grants", http.RedirectHandler("/", http.StatusMovedPermanently)) // pre-dashboard URL
 	mux.Handle("POST /oauth/grants/revoke", s.cop.Handler(http.HandlerFunc(s.revoke)))
 }
 

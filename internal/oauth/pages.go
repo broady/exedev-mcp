@@ -27,9 +27,18 @@ type grantRow struct {
 	LastUsed     time.Time
 }
 
-type grantsPage struct {
-	Email  string
-	Grants []grantRow
+type dashboardPage struct {
+	Email          string
+	Resource       string // MCP URL to add as a connector
+	AccountChecked bool
+	Account        string // exe.dev account the API integration acts as
+	AccountErr     string
+	Grants         []grantRow
+}
+
+// AccountMismatch reports an API integration holding someone else's token.
+func (d dashboardPage) AccountMismatch() bool {
+	return d.Account != "" && !strings.EqualFold(d.Account, d.Email)
 }
 
 type messagePage struct {
@@ -105,6 +114,15 @@ ul.grants { list-style:none; margin:16px 0 0; padding:0; }
 ul.grants li { display:flex; align-items:center; gap:12px; padding:12px 0; }
 ul.grants li + li { border-top:1px solid var(--line); }
 .grow { flex:1; min-width:0; } .grow b { display:block; font-weight:500; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; } .grow small { color:var(--muted); font-size:.8125rem; }
+.card + .card { margin-top:16px; }
+code { font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; }
+code.url, code.cmd { display:block; margin:10px 0 0; padding:10px 12px; background:var(--sunk); border:1px solid var(--line); border-radius:10px; overflow-wrap:anywhere; user-select:all; }
+code.url { font-size:14px; font-weight:500; }
+.card .label { margin:16px 0 0; }
+.status { display:flex; align-items:flex-start; gap:10px; margin:20px 0 0; padding-top:16px; border-top:1px solid var(--line); font-size:.875rem; color:var(--muted); }
+.status b { color:var(--fg); font-weight:500; }
+.status .dot { flex:none; width:8px; height:8px; margin-top:7px; border-radius:99px; background:var(--ok-fg); }
+.status.bad { color:var(--warn-fg); } .status.bad .dot { background:var(--warn-fg); }
 .empty { margin:16px 0 0; padding:24px; text-align:center; border:1px dashed var(--line); border-radius:12px; color:var(--muted); font-size:.875rem; }
 </style></head><body><main>
 <div class="brand"><b>exe.dev</b> MCP</div>{{end}}
@@ -143,13 +161,25 @@ Only continue if you just started this connection yourself.</span></div>{{end}}
 <div class="actions"><button name="action" value="deny">Deny</button><button class="primary" name="action" value="approve">Allow</button></div>
 </form>
 </div>
-<p class="foot">You can revoke access at any time in <a href="/oauth/grants">connected applications</a>.</p>
+<p class="foot">You can revoke access at any time in <a href="/">the dashboard</a>.</p>
 {{template "foot"}}{{end}}
 
-{{define "grants"}}{{template "head" "Connected applications"}}
+{{define "dashboard"}}{{template "head" "Dashboard"}}
+<div class="card">
+<h1>Connect Claude</h1>
+<p>Add this URL as a custom connector in Claude: Settings, Connectors, Add custom connector.</p>
+<code class="url">{{.Resource}}</code>
+<p class="label">Claude Code</p>
+<code class="cmd">claude mcp add --transport http exe {{.Resource}}</code>
+{{if .AccountChecked}}<div class="status {{if or .AccountErr .AccountMismatch}}bad{{else}}good{{end}}">
+  <span class="dot" aria-hidden="true"></span>
+  <span>{{if .AccountErr}}exe.dev API unreachable: {{.AccountErr}}. Check the http-proxy integration attached to this VM.
+  {{- else if .AccountMismatch}}exe.dev API acts as <b>{{.Account}}</b>, not you. The integration holds someone else's token.
+  {{- else}}exe.dev API connected as <b>{{.Account}}</b>{{end}}</span>
+</div>{{end}}
+</div>
 <div class="card">
 <h1>Connected applications</h1>
-<p>Signed in as {{.Email}}.</p>
 {{if .Grants}}<ul class="grants">
 {{range .Grants}}<li>
   <div class="avatar sm" aria-hidden="true">{{initial .Client}}</div>
@@ -158,6 +188,7 @@ Only continue if you just started this connection yourself.</span></div>{{end}}
 </li>
 {{end}}</ul>{{else}}<div class="empty">No applications are connected.</div>{{end}}
 </div>
+<p class="foot">Signed in as {{.Email}}.</p>
 {{template "foot"}}{{end}}
 
 {{define "message"}}{{template "head" .Title}}
@@ -172,8 +203,8 @@ func (s *Server) page(w http.ResponseWriter, status int, data any) {
 	switch data.(type) {
 	case consentPage:
 		name = "consent"
-	case grantsPage:
-		name = "grants"
+	case dashboardPage:
+		name = "dashboard"
 	case messagePage:
 		name = "message"
 	default:

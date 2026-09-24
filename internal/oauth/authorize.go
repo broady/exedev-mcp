@@ -1,10 +1,12 @@
 package oauth
 
 import (
+	"context"
 	"net/http"
 	"net/url"
 	"slices"
 	"strings"
+	"time"
 )
 
 // authorize handles GET /oauth/authorize: authenticate the owner, validate
@@ -167,22 +169,37 @@ func (s *Server) redirectWith(redirectURI string, params url.Values) string {
 	return u.String()
 }
 
-// grants lists the owner's grants with revoke buttons.
-func (s *Server) grants(w http.ResponseWriter, r *http.Request) {
+// accountTimeout bounds the dashboard's exe.dev API check; the page
+// renders without it rather than hang.
+const accountTimeout = 5 * time.Second
+
+// dashboard shows the owner how to connect, whether the exe.dev API
+// integration works, and the connected applications.
+func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 	email, ok := s.identity(w, r, r.URL.RequestURI())
 	if !ok {
 		return
 	}
+	d := dashboardPage{Email: email, Resource: s.resource}
+	if s.account != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), accountTimeout)
+		acct, err := s.account(ctx)
+		cancel()
+		d.Account, d.AccountChecked = acct, true
+		if err != nil {
+			s.log.Warn("dashboard: exe.dev account check", "err", err)
+			d.AccountErr = err.Error()
+		}
+	}
 	s.mu.Lock()
-	var list []grantRow
 	for _, g := range s.st.Grants {
 		if g.Email == email {
-			list = append(list, grantRow{ID: string(g.ID), Client: g.ClientName, RedirectHost: g.RedirectHost, Created: g.CreatedAt, LastUsed: g.RefreshedAt})
+			d.Grants = append(d.Grants, grantRow{ID: string(g.ID), Client: g.ClientName, RedirectHost: g.RedirectHost, Created: g.CreatedAt, LastUsed: g.RefreshedAt})
 		}
 	}
 	s.mu.Unlock()
-	slices.SortFunc(list, func(a, b grantRow) int { return b.LastUsed.Compare(a.LastUsed) })
-	s.page(w, http.StatusOK, grantsPage{Email: email, Grants: list})
+	slices.SortFunc(d.Grants, func(a, b grantRow) int { return b.LastUsed.Compare(a.LastUsed) })
+	s.page(w, http.StatusOK, d)
 }
 
 func (s *Server) revoke(w http.ResponseWriter, r *http.Request) {
@@ -210,7 +227,7 @@ func (s *Server) revoke(w http.ResponseWriter, r *http.Request) {
 	if ok {
 		s.log.Info("oauth: grant revoked by owner", "grant", id, "client_name", g.ClientName)
 	}
-	http.Redirect(w, r, "/oauth/grants", http.StatusSeeOther)
+	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
 // revokeGrantLocked deletes a grant, which also invalidates its access

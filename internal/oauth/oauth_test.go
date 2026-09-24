@@ -1,6 +1,7 @@
 package oauth
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
@@ -571,7 +572,10 @@ func TestGrantsPageRevoke(t *testing.T) {
 		"client_id": {string(id)}, "code_verifier": {verifier},
 	})
 
-	page := readAll(h.do("GET", "/oauth/grants", owner, nil, nil))
+	if loc := h.do("GET", "/oauth/grants", owner, nil, nil).Header.Get("Location"); loc != "/" {
+		t.Errorf("old grants URL redirects to %q, want /", loc)
+	}
+	page := readAll(h.do("GET", "/", owner, nil, nil))
 	m := regexp.MustCompile(`name="grant_id" value="([^"]+)"`).FindStringSubmatch(page)
 	if m == nil || !strings.Contains(page, "Claude") {
 		t.Fatalf("grants page:\n%s", page)
@@ -579,8 +583,8 @@ func TestGrantsPageRevoke(t *testing.T) {
 	resp := h.do("POST", "/oauth/grants/revoke", owner, strings.NewReader(url.Values{"grant_id": {m[1]}}.Encode()), http.Header{
 		"Content-Type": {"application/x-www-form-urlencoded"}, "Sec-Fetch-Site": {"same-origin"},
 	})
-	if resp.StatusCode != http.StatusSeeOther {
-		t.Fatalf("revoke: %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusSeeOther || resp.Header.Get("Location") != "/" {
+		t.Fatalf("revoke: %d %s", resp.StatusCode, resp.Header.Get("Location"))
 	}
 	if _, err := h.s.Verify(t.Context(), str(tok, "access_token"), nil); err == nil {
 		t.Error("access token valid after revoke")
@@ -698,6 +702,46 @@ func TestNewValidatesConfig(t *testing.T) {
 	} {
 		if _, err := New(cfg); err == nil {
 			t.Errorf("New(%+v): want error", cfg)
+		}
+	}
+}
+
+func TestDashboard(t *testing.T) {
+	var acct string
+	var acctErr error
+	s, err := New(Config{
+		Issuer: testIssuer, Owners: []string{owner}, StatePath: filepath.Join(t.TempDir(), "state.json"),
+		Account: func(context.Context) (string, error) { return acct, acctErr },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	s.Register(mux)
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	h := &harness{t: t, s: s, srv: srv}
+
+	if resp := h.do("GET", "/", "", nil, nil); resp.StatusCode != http.StatusFound || !strings.Contains(resp.Header.Get("Location"), "/__exe.dev/login") {
+		t.Errorf("signed out: %d %s", resp.StatusCode, resp.Header.Get("Location"))
+	}
+	if resp := h.do("GET", "/", "stranger@example.com", nil, nil); resp.StatusCode != http.StatusForbidden {
+		t.Errorf("non-owner: %d", resp.StatusCode)
+	}
+
+	for _, tc := range []struct {
+		name, acct string
+		err        error
+		want       string
+	}{
+		{"connected", owner, nil, "exe.dev API connected as"},
+		{"unreachable", "", errors.New("HTTP 502"), "exe.dev API unreachable: HTTP 502"},
+		{"mismatch", "someone@example.com", nil, "holds someone else's token"},
+	} {
+		acct, acctErr = tc.acct, tc.err
+		page := readAll(h.do("GET", "/", owner, nil, nil))
+		if !strings.Contains(page, tc.want) || !strings.Contains(page, testIssuer+"/mcp") {
+			t.Errorf("%s: page missing %q or connector URL:\n%s", tc.name, tc.want, page)
 		}
 	}
 }

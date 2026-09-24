@@ -51,16 +51,17 @@ func (c *serveCmd) Run(a *app) error {
 		}
 		c.State = filepath.Join(dir, "exe-mcp", "oauth.json")
 	}
+	client, err := exe.New(exe.Config{Endpoint: c.ExecURL})
+	if err != nil {
+		return err
+	}
 	authz, err := oauth.New(oauth.Config{
 		Issuer:    c.PublicURL,
 		Owners:    c.Owner,
 		StatePath: c.State,
+		Account:   func(ctx context.Context) (string, error) { return whoami(ctx, client) },
 		Logger:    a.log,
 	})
-	if err != nil {
-		return err
-	}
-	client, err := exe.New(exe.Config{Endpoint: c.ExecURL})
 	if err != nil {
 		return err
 	}
@@ -73,10 +74,6 @@ func (c *serveCmd) Run(a *app) error {
 		Scopes:              []string{oauth.Scope},
 	})
 	mux.Handle("/mcp", requireToken(http.MaxBytesHandler(newMCPHandler(mcpServer, a.log), maxMCPBody)))
-	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		_, _ = fmt.Fprintf(w, "exe.dev MCP server.\n\nAdd %s as a custom connector in Claude.\nManage connected applications at %s/oauth/grants\n", authz.Resource(), c.PublicURL)
-	})
 
 	srv := &http.Server{
 		Addr:              c.Addr,
@@ -129,6 +126,21 @@ func newMCPHandler(s *mcp.Server, log *slog.Logger) http.Handler {
 			DisableLocalhostProtection: true,
 		},
 	)
+}
+
+// whoami returns the email of the account the exe.dev API acts as.
+func whoami(ctx context.Context, c *exe.Client) (string, error) {
+	raw, err := c.Lobby(ctx, "whoami")
+	if err != nil {
+		return "", err
+	}
+	var out struct {
+		Email string `json:"email"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil || out.Email == "" {
+		return "", fmt.Errorf("unexpected whoami response: %.200s", raw)
+	}
+	return out.Email, nil
 }
 
 // discover fills the public URL and owner from the exe.dev Reflection

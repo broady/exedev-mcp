@@ -79,7 +79,7 @@ page then asks you to allow the client.
 The connector also works in Claude Code:
 `claude mcp add --transport http exe https://my-mcp.exe.xyz/mcp`.
 
-To see and revoke connected applications, open `https://my-mcp.exe.xyz/oauth/grants`.
+The dashboard at `https://my-mcp.exe.xyz/` shows the connector URL, checks that the API integration works and which account it acts as, and lists connected applications so you can revoke them.
 
 `serve` reads its VM name and owner from the exe.dev Reflection integration.
 Overrides go in `~/.config/exe-mcp/env` on the VM:
