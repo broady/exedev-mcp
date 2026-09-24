@@ -1,0 +1,225 @@
+# Based on the production-go golangci.yml.
+version: "2"
+
+run:
+  # Large module graphs + staticcheck can be slow on cold caches.
+  timeout: 5m
+
+linters:
+  # Disable everything by default, then enable exactly what we want.
+  # This prevents new linters from silently appearing on upgrade.
+  default: none
+  enable:
+    # --- Correctness ---
+    - govet           # printf mismatches, struct tags, unreachable code
+    - staticcheck     # the most comprehensive Go analyzer
+    - errcheck        # every error must be checked
+    - bodyclose       # unclosed http.Response.Body leaks connections
+    - noctx           # HTTP requests without context
+    - contextcheck    # do not discard incoming contexts
+    - fatcontext      # avoid context/timer leaks from contexts created in loops
+    - nilerr          # returning nil inside if err != nil
+    - exhaustive      # exhaustive switch on enum types
+    - forcetypeassert # single-value type assertions can panic
+
+    # --- Style ---
+    - revive          # configurable linter (replaces golint)
+    - errname         # ErrFoo / FooError naming
+    - misspell        # typos in comments and strings
+    - predeclared     # avoid shadowing built-in names like error/string/len
+    - sloglint        # type-safe, context-aware slog calls
+
+    # --- Performance ---
+    - prealloc        # slice preallocation when bound is known
+    - goconst         # repeated string literals -> constants
+
+    # --- Security ---
+    - gosec           # common security issues
+
+    # --- Architectural boundaries ---
+    - depguard        # enforce import deny-lists and layer separation
+
+    # --- Banned patterns ---
+    - forbidigo       # ban fmt.Print*, log.Print*, etc.
+
+  settings:
+    govet:
+      # Enable all analyzers including those not on by default.
+      enable-all: true
+      disable:
+        # Field order is chosen for readability; none of these structs are hot.
+        - fieldalignment
+        # Shadowing err in a nested scope is idiomatic.
+        - shadow
+
+    misspell:
+      ignore-rules:
+        - broady
+
+    revive:
+      rules:
+        # No dot imports — they pollute the namespace and make code
+        # harder to read because you can't tell where names come from.
+        - name: dot-imports
+
+        # No empty blocks — usually a sign of unfinished code or a
+        # swallowed error. If intentional, add a comment explaining why.
+        - name: empty-block
+
+        # Bare returns are confusing in functions with named return values.
+        - name: bare-return
+
+        # Enforce consistent error return placement (last return value).
+        - name: error-return
+
+        # Unreachable code after return/panic/os.Exit.
+        - name: unreachable-code
+
+    forbidigo:
+      forbid:
+        # Ban unstructured process output. Operational logs use slog; CLI
+        # user-facing output goes through an injected io.Writer.
+        - pattern: '^fmt\.Print.*$'
+          msg: "use logger.LogAttrs for operational logs or an injected io.Writer for CLI output"
+
+        # Ban unstructured logging. log.Fatal* is allowed only in main(), so
+        # either exclude cmd/*/main.go below or keep main() on slog + os.Exit.
+        - pattern: '^log\.Print.*$'
+          msg: "use slog instead of log.Print*"
+        - pattern: '^log\.Fatal.*$'
+          msg: "log.Fatal* is allowed only in main(); return an error elsewhere"
+        - pattern: '^log\.Panic.*$'
+          msg: "use slog and return an error instead of log.Panic*"
+        - pattern: '^os\.Exit$'
+          msg: "os.Exit is allowed only in main(); return an error elsewhere"
+
+        # Ban slog's hidden global logger. Constructors take *slog.Logger.
+        - pattern: '^slog\.Default$'
+          msg: "slog.Default() is allowed only in main() or test bootstrap; pass *slog.Logger through constructors"
+        - pattern: '^slog\.(Debug|Info|Warn|Error|Log|LogAttrs)$'
+          msg: "do not use slog's package-level logger; use an injected *slog.Logger and LogAttrs"
+
+        # Ban context-as-service-locator helpers. Extend this list with local
+        # helper package names used by the project.
+        - pattern: '^ctxutil\.(DB|Tx|Store|Repository|Client|Service|Logger|Config|Clock|IDGenerator)$'
+          msg: "dependencies come from constructors, not context.Context"
+
+      # Only enforce in non-test files. Tests may use fmt.Print for debugging.
+      exclude-godoc-examples: true
+      analyze-types: true
+
+    depguard:
+      rules:
+        main:
+          deny:
+            - pkg: io/ioutil
+              desc: deprecated since Go 1.16; use os or io instead
+            - pkg: github.com/pkg/errors
+              desc: use stdlib errors + fmt.Errorf with %w
+
+    exhaustive:
+      # Only enforce on type switches and enum switches that are clearly
+      # intended to be exhaustive (have no default case).
+      default-signifies-exhaustive: true
+
+    errcheck:
+      # Do not exclude any functions. Every error matters.
+      # If you intentionally discard one, use:
+      #   _ = conn.Close() //nolint:errcheck // best-effort cleanup
+      # Close errors on a response body being read carry no information.
+      exclude-functions:
+        - (io.ReadCloser).Close
+
+    goconst:
+      # Flag strings repeated 3 or more times.
+      min-occurrences: 3
+      # Protocol field names read better inline than as constants.
+      ignore-string-values:
+        - '^[a-z_]+$'
+
+    gosec:
+      excludes:
+        # G104 is redundant with errcheck.
+        - G104
+        # Operator-configured paths (state file) are trusted.
+        - G304
+
+    sloglint:
+      no-global: "all"
+      static-msg: true
+      key-naming-case: snake
+
+  exclusions:
+    # Allow fmt.Print*, log.*, and os.Exit in test files.
+    rules:
+      - linters:
+          - forbidigo
+        path: _test\.go
+
+      # Allow log.Fatal* in main packages. Non-main code returns errors.
+      - linters:
+          - forbidigo
+        path: cmd/.*/main\.go
+        text: "log.Fatal"
+
+      # Allow os.Exit in main packages. Non-main code returns errors.
+      - linters:
+          - forbidigo
+        path: cmd/.*/main\.go
+        text: "os.Exit"
+
+      # Allow slog.Default in main packages for process bootstrap.
+      - linters:
+          - forbidigo
+        path: cmd/.*/main\.go
+        text: "slog.Default"
+
+      # CIMD fetches attacker-chosen URLs by design; the fetcher refuses
+      # non-public addresses at dial time (see newMetadataFetcher).
+      - linters:
+          - gosec
+        path: internal/oauth/clients\.go
+        text: G704
+
+      # CLI output in main packages goes to stdout by design.
+      - linters:
+          - forbidigo
+        path: cmd/
+        text: "fmt.Print"
+
+      # Test fixtures repeat literals, and tests talk to their own servers.
+      - linters:
+          - errcheck
+          - goconst
+          - bodyclose
+          - noctx
+          - forcetypeassert
+          - gosec
+        path: _test\.go
+
+      # Allow unused parameters in test helpers and interface implementations.
+      - linters:
+          - revive
+        text: "unused-parameter"
+
+    # Do not skip any directories — lint everything.
+    paths: []
+
+formatters:
+  enable:
+    - gofumpt
+    - gci
+  settings:
+    gofumpt:
+      extra:
+        group-params: true
+    gci:
+      sections:
+        - standard
+        - default
+        - localmodule
+
+issues:
+  # Show all issues, do not cap per-linter.
+  max-issues-per-linter: 0
+  max-same-issues: 0

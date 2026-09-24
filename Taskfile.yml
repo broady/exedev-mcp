@@ -1,0 +1,54 @@
+version: '3'
+
+vars:
+  BIN: bin/exe-mcp
+
+tasks:
+  default:
+    cmds: [task: check]
+
+  build:
+    desc: Build the binary
+    cmds:
+      - go build -trimpath -o {{.BIN}} ./cmd/exe-mcp
+
+  build:linux:
+    desc: Build a static linux/amd64 binary for exe.dev VMs
+    env: {CGO_ENABLED: "0", GOOS: linux, GOARCH: amd64}
+    cmds:
+      - go build -trimpath -ldflags=-s -o {{.BIN}}-linux-amd64 ./cmd/exe-mcp
+
+  test:
+    desc: Run tests
+    cmds:
+      - go test -race ./...
+
+  lint:
+    desc: Run linters
+    cmds:
+      - golangci-lint run ./...
+
+  fmt:
+    desc: Format (gofumpt, gci)
+    cmds:
+      - golangci-lint fmt ./...
+
+  check:
+    desc: Lint (includes format and vet checks), test
+    cmds:
+      - task: lint
+      - task: test
+
+  deploy:
+    desc: "Install and (re)start the server on a VM: task deploy VM=myvm"
+    requires: {vars: [VM]}
+    deps: [build:linux]
+    cmds:
+      - ssh {{.VM}}.exe.xyz 'mkdir -p ~/.local/bin ~/.config/exe-mcp'
+      - scp -q {{.BIN}}-linux-amd64 {{.VM}}.exe.xyz:.local/bin/exe-mcp.new
+      - scp -q deploy/exe-mcp.service {{.VM}}.exe.xyz:/tmp/exe-mcp.service
+      - >-
+        ssh {{.VM}}.exe.xyz 'mv ~/.local/bin/exe-mcp.new ~/.local/bin/exe-mcp &&
+        sudo mv /tmp/exe-mcp.service /etc/systemd/system/exe-mcp.service &&
+        sudo systemctl daemon-reload && sudo systemctl enable -q exe-mcp && sudo systemctl restart exe-mcp &&
+        sleep 1 && systemctl --no-pager status exe-mcp | head -5'

@@ -1,0 +1,23 @@
+[Unit]
+Description=exe.dev MCP server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=exedev
+Group=exedev
+Environment=HOME=/home/exedev
+# Optional overrides, e.g. EXE_MCP_EXEC_URL=https://my-integration.int.exe.xyz/exec
+EnvironmentFile=-/home/exedev/.config/exe-mcp/env
+ExecStart=/home/exedev/.local/bin/exe-mcp serve
+Restart=always
+RestartSec=5
+TimeoutStopSec=40
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/home/exedev/.config/exe-mcp
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
