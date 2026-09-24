@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/auth"
 )
@@ -140,6 +141,23 @@ func (h *harness) approve(p authzParams, action string) *url.URL {
 		h.t.Fatal(err)
 	}
 	return loc
+}
+
+// fullFlow registers a client, approves it, exchanges the code, and
+// returns the access and refresh tokens.
+func (h *harness) fullFlow() (access, refresh string) {
+	h.t.Helper()
+	id := h.register(claudeCB)
+	verifier, challenge := pkce()
+	code := h.approve(authzParams{clientID: id, redirect: claudeCB, challenge: challenge}, "approve").Query().Get("code")
+	status, tok := h.tokenReq(url.Values{
+		"grant_type": {"authorization_code"}, "code": {code}, "redirect_uri": {claudeCB},
+		"client_id": {string(id)}, "code_verifier": {verifier},
+	})
+	if status != 200 {
+		h.t.Fatalf("token: %d %v", status, tok)
+	}
+	return str(tok, "access_token"), str(tok, "refresh_token")
 }
 
 func (h *harness) tokenReq(form url.Values) (int, map[string]any) {
@@ -473,8 +491,8 @@ func TestPersistenceAcrossRestart(t *testing.T) {
 	})
 
 	h2 := newHarnessAt(t, h.statePath)
-	if _, err := h2.s.Verify(t.Context(), str(tok, "access_token"), nil); err == nil {
-		t.Error("access tokens should not survive a restart")
+	if _, err := h2.s.Verify(t.Context(), str(tok, "access_token"), nil); err != nil {
+		t.Errorf("access token after restart: %v", err)
 	}
 	status, out := h2.tokenReq(url.Values{"grant_type": {"refresh_token"}, "refresh_token": {str(tok, "refresh_token")}, "client_id": {string(id)}})
 	if status != 200 {
@@ -482,6 +500,64 @@ func TestPersistenceAcrossRestart(t *testing.T) {
 	}
 	if _, err := h2.s.Verify(t.Context(), str(out, "access_token"), nil); err != nil {
 		t.Error(err)
+	}
+	// The refresh bumped the generation persistently: the first access
+	// token stays dead across another restart.
+	h3 := newHarnessAt(t, h.statePath)
+	if _, err := h3.s.Verify(t.Context(), str(tok, "access_token"), nil); err == nil {
+		t.Error("superseded access token valid after restart")
+	}
+}
+
+func TestAccessTokenForgery(t *testing.T) {
+	h := newHarness(t)
+	at, _ := h.fullFlow()
+	claims, err := parseAccess(h.s.st.AccessKey, at)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Forgeries below differ from a valid token only in the MAC, so they
+	// fail only if the MAC is checked.
+	body, mac, _ := strings.Cut(strings.TrimPrefix(at, accessPrefix), ".")
+	p, _ := base64.RawURLEncoding.DecodeString(body)
+	p[8] ^= 1 // expiry moves by a second; grant and generation unchanged
+	tampered, err := parseAccess(h.s.st.AccessKey, accessPrefix+base64.RawURLEncoding.EncodeToString(p)+"."+base64.RawURLEncoding.EncodeToString(accessMAC(h.s.st.AccessKey, p)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.s.Verify(t.Context(), signAccess(h.s.st.AccessKey, tampered), nil); err != nil {
+		t.Fatalf("re-signed tampered claims should be valid: %v", err)
+	}
+	for name, tok := range map[string]string{
+		"tampered payload": accessPrefix + base64.RawURLEncoding.EncodeToString(p) + "." + mac,
+		"truncated":        at[:len(at)-4],
+		"no prefix":        strings.TrimPrefix(at, accessPrefix),
+		"other key":        signAccess(make([]byte, accessKeySize), claims),
+		"empty":            "",
+	} {
+		if _, err := h.s.Verify(t.Context(), tok, nil); !errors.Is(err, auth.ErrInvalidToken) {
+			t.Errorf("%s: Verify err = %v", name, err)
+		}
+	}
+
+	h.s.now = func() time.Time { return time.Now().Add(accessTokenTTL + time.Second) }
+	if _, err := h.s.Verify(t.Context(), at, nil); !errors.Is(err, auth.ErrInvalidToken) {
+		t.Errorf("expired: Verify err = %v", err)
+	}
+}
+
+func TestRemovedOwnerLosesAccess(t *testing.T) {
+	h := newHarness(t)
+	at, rt := h.fullFlow()
+	s2, err := New(Config{Issuer: testIssuer, Owners: []string{"someone-else@example.com"}, StatePath: h.statePath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s2.Verify(t.Context(), at, nil); !errors.Is(err, auth.ErrInvalidToken) {
+		t.Errorf("access token of removed owner: %v", err)
+	}
+	if _, err := s2.refresh("", rt, ""); err == nil {
+		t.Error("refresh by removed owner succeeded")
 	}
 }
 

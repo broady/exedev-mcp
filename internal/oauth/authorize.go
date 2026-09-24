@@ -213,13 +213,9 @@ func (s *Server) revoke(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/oauth/grants", http.StatusSeeOther)
 }
 
-// revokeGrantLocked deletes a grant and its access tokens. s.mu must be held.
+// revokeGrantLocked deletes a grant, which also invalidates its access
+// tokens. s.mu must be held.
 func (s *Server) revokeGrantLocked(id GrantID) error {
 	delete(s.st.Grants, id)
-	for k, at := range s.access {
-		if at.grant == id {
-			delete(s.access, k)
-		}
-	}
 	return s.saveLocked()
 }

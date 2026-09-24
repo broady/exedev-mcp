@@ -169,6 +169,8 @@ func (s *Server) refresh(clientID ClientID, refresh, scope string) (*tokenRespon
 		switch {
 		case !now.Before(g.RefreshExpiresAt):
 			return nil, invalidGrant("refresh token expired")
+		case !slices.Contains(s.owners, g.Email):
+			return nil, invalidGrant("the authorizing user is no longer an owner of this server")
 		case clientID != "" && clientID != g.ClientID:
 			return nil, invalidGrant("refresh token was issued to a different client")
 		}
@@ -183,15 +185,11 @@ func (s *Server) refresh(clientID ClientID, refresh, scope string) (*tokenRespon
 		prev := *g
 		g.PrevRefreshHash, g.RefreshHash = g.RefreshHash, hashToken(next)
 		g.RefreshedAt, g.RefreshExpiresAt = now, now.Add(refreshTokenTTL)
+		// The client replaces its access token on refresh; the old one goes.
+		g.AccessGen++
 		if err := s.saveLocked(); err != nil {
 			*g = prev
 			return nil, err
-		}
-		// The client replaces its access token on refresh; old ones go.
-		for k, at := range s.access {
-			if at.grant == g.ID {
-				delete(s.access, k)
-			}
 		}
 		return s.issueAccessLocked(g, next), nil
 	}
@@ -200,14 +198,7 @@ func (s *Server) refresh(clientID ClientID, refresh, scope string) (*tokenRespon
 
 // issueAccessLocked mints an access token for g. s.mu must be held.
 func (s *Server) issueAccessLocked(g *grant, refresh string) *tokenResponse {
-	now := s.now()
-	for k, at := range s.access {
-		if !now.Before(at.expires) {
-			delete(s.access, k)
-		}
-	}
-	tok := newSecret("exm_at_")
-	s.access[hashToken(tok)] = &accessToken{grant: g.ID, email: g.Email, scopes: slices.Clone(g.Scopes), expires: now.Add(accessTokenTTL)}
+	tok := signAccess(s.st.AccessKey, accessClaims{grant: g.ID, gen: g.AccessGen, expires: s.now().Add(accessTokenTTL)})
 	return &tokenResponse{
 		AccessToken:  tok,
 		TokenType:    "Bearer",
@@ -226,11 +217,6 @@ func (s *Server) evictOldestGrantLocked() {
 	}
 	if oldest != nil {
 		delete(s.st.Grants, oldest.ID)
-		for k, at := range s.access {
-			if at.grant == oldest.ID {
-				delete(s.access, k)
-			}
-		}
 	}
 }
 

@@ -114,9 +114,12 @@ Overrides go in `~/.config/exe-mcp/env` on the VM:
   - client ID metadata documents, with dynamic client registration as a
     fallback;
   - resource indicators (RFC 8707) and `iss` in redirects (RFC 9207).
-- **Tokens.** Access tokens last 1 hour and are held only in memory, so they
-  don't survive a restart. Refresh tokens rotate on every use. Reusing an old
-  refresh token revokes the whole grant. Only token hashes are stored.
+- **Tokens.** Access tokens last 1 hour. They are MACed with a key in the
+  state file and checked against their grant on every request, so they
+  survive restarts, yet revoking a grant or removing an owner cuts them off
+  at once. Refresh tokens rotate on every use, and each refresh retires the
+  previous access token. Reusing an old refresh token revokes the whole
+  grant. Only refresh token hashes are stored.
 - **Login.** exe.dev login identifies the user through the `X-ExeDev-Email`
   header, which the exe.dev proxy sets and strips from client requests. Only
   owners (`--owner`) can authorize. Anyone else gets 403, and a stranger
@@ -130,8 +133,9 @@ Overrides go in `~/.config/exe-mcp/env` on the VM:
   through the proxy but can't take it anywhere else. Scope it with `--cmds`
   and `--exp`.
 
-The MCP endpoint is stateless, so restarts are harmless apart from access
-tokens: clients get a 401 and refresh.
+The MCP endpoint is stateless and access tokens survive restarts, so
+connected clients don't notice a restart. Only an authorization in progress
+(a consent page left open) has to start again.
 
 ## How commands run
 

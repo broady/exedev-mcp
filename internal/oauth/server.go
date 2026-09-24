@@ -15,6 +15,7 @@ package oauth
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -80,7 +81,6 @@ type Server struct {
 	st       *state
 	pending  map[string]*pendingAuthorization
 	codes    map[tokenHash]*authorizationCode
-	access   map[tokenHash]*accessToken
 	metadata map[ClientID]cachedMetadata
 }
 
@@ -102,13 +102,6 @@ type authorizationCode struct {
 	scopes        []string
 	email         string
 	expires       time.Time
-}
-
-type accessToken struct {
-	grant   GrantID
-	email   string
-	scopes  []string
-	expires time.Time
 }
 
 // New returns a Server, loading persisted state.
@@ -149,8 +142,14 @@ func New(cfg Config) (*Server, error) {
 		st:           st,
 		pending:      map[string]*pendingAuthorization{},
 		codes:        map[tokenHash]*authorizationCode{},
-		access:       map[tokenHash]*accessToken{},
 		metadata:     map[ClientID]cachedMetadata{},
+	}
+	if len(st.AccessKey) != accessKeySize {
+		st.AccessKey = make([]byte, accessKeySize)
+		rand.Read(st.AccessKey)
+		if err := s.saveLocked(); err != nil {
+			return nil, fmt.Errorf("oauth: %w", err)
+		}
 	}
 	return s, nil
 }
@@ -193,11 +192,23 @@ func (s *Server) Register(mux *http.ServeMux) {
 func (s *Server) Verify(_ context.Context, token string, _ *http.Request) (*auth.TokenInfo, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	at, ok := s.access[hashToken(token)]
-	if !ok || !s.now().Before(at.expires) {
-		return nil, fmt.Errorf("%w: unknown or expired token", auth.ErrInvalidToken)
+	c, err := parseAccess(s.st.AccessKey, token)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", auth.ErrInvalidToken, err)
 	}
-	return &auth.TokenInfo{Scopes: slices.Clone(at.scopes), Expiration: at.expires, UserID: at.email}, nil
+	if !s.now().Before(c.expires) {
+		return nil, fmt.Errorf("%w: expired token", auth.ErrInvalidToken)
+	}
+	g, ok := s.st.Grants[c.grant]
+	switch {
+	case !ok:
+		return nil, fmt.Errorf("%w: grant revoked", auth.ErrInvalidToken)
+	case c.gen != g.AccessGen:
+		return nil, fmt.Errorf("%w: superseded by a refresh", auth.ErrInvalidToken)
+	case !slices.Contains(s.owners, g.Email):
+		return nil, fmt.Errorf("%w: %s is no longer an owner", auth.ErrInvalidToken, g.Email)
+	}
+	return &auth.TokenInfo{Scopes: slices.Clone(g.Scopes), Expiration: c.expires, UserID: g.Email}, nil
 }
 
 // identity returns the authenticated owner's email, or writes a response

@@ -61,15 +61,21 @@ type grant struct {
 	RefreshHash      tokenHash `json:"refresh_hash"`
 	PrevRefreshHash  tokenHash `json:"prev_refresh_hash,omitempty"`
 	RefreshExpiresAt time.Time `json:"refresh_expires_at"`
+	// AccessGen is bumped on every refresh; access tokens carry the
+	// generation they were minted at, and only the current one verifies.
+	AccessGen uint64 `json:"access_gen,omitempty"`
 }
 
-// state is everything that must survive a restart. Access tokens and
-// authorization codes are deliberately memory-only: after a restart
-// clients get a 401 and use their refresh token.
+// state is everything that must survive a restart. Authorization codes
+// and pending consents are memory-only: they live for minutes, and losing
+// them just means starting the authorization again.
 type state struct {
-	Version int                            `json:"version"`
-	Clients map[ClientID]*registeredClient `json:"clients"`
-	Grants  map[GrantID]*grant             `json:"grants"`
+	Version int `json:"version"`
+	// AccessKey MACs access tokens (see access.go). Created on first start;
+	// losing it invalidates access tokens, and clients refresh.
+	AccessKey []byte                         `json:"access_key,omitempty"`
+	Clients   map[ClientID]*registeredClient `json:"clients"`
+	Grants    map[GrantID]*grant             `json:"grants"`
 }
 
 const stateVersion = 1
@@ -109,7 +115,7 @@ func loadState(path string) (*state, error) {
 // saveState writes st atomically: temp file, fsync, rename, fsync dir.
 // A crash leaves either the old state or the new one, never a torn file.
 func saveState(path string, st *state) error {
-	b, err := json.MarshalIndent(st, "", "  ")
+	b, err := json.MarshalIndent(st, "", "  ") //nolint:gosec // G117: AccessKey must persist; the file is 0600 (CreateTemp)
 	if err != nil {
 		return fmt.Errorf("marshal state: %w", err)
 	}
